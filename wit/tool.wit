@@ -140,6 +140,9 @@ world tool-lifecycle {
 world tool-component {
     include tool-core;
     export wasi:http/handler@0.3.0;
+    /// Every component exports it (tool-wasi's export_tool! implements it
+    /// with the instance's suspend and resume, which refuse by default).
+    export lifecycle;
 }
 
 /// A tool that can also play sound, through a custom interface.

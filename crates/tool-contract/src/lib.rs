@@ -485,6 +485,102 @@ pub struct Question {
 /// A future that runs on the tool's one thread (not Send).
 pub type LocalFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T>>>;
 
+// ------------------------------------------------------------ the instance
+
+/// Why a host wants an instance gone (see [`ToolInstance::suspend`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SuspendReason {
+    /// Nothing has called for a while.
+    Idle,
+    /// Its memory has grown; a fresh instance starts small.
+    Memory,
+    /// The host is exiting; the snapshot is kept for the next run.
+    Exit,
+}
+
+/// What tool-rest needs from the tool, in process: the tool's HTTP
+/// interface runs inside it, natively and in a component alike.
+pub trait HttpService {
+    fn invoke(&self, cx: &Context, command: &str, input: Value) -> LocalFuture<Result<Value, ToolError>>;
+    /// The shared state (with `revision`), with the changes after `since`.
+    fn state(&self, since: Option<u64>) -> Option<Value>;
+    /// Resolves once the state's revision is past `after`.
+    fn changed(&self, after: u64) -> LocalFuture<()>;
+    fn sleep(&self, ms: u64) -> LocalFuture<()>;
+    fn asset(&self, path: &str) -> Option<Asset>;
+    /// A page opened (true) or closed (false) the event stream.
+    fn page(&self, connected: bool);
+    /// Whether a request's token is the one the tool issued when it asked
+    /// to be served (false while it isn't served).
+    fn authorized(&self, token: &str) -> bool;
+}
+
+/// One instance of a tool, as every runtime drives it: the native build
+/// (tool-native) calls it in process, and a component exports it
+/// (tool-wasi's `export_tool!`) for a host (tool-host) to call. A tool
+/// implements it once, in its core.
+///
+/// Calls arrive on one thread, the instance's owner, and may interleave
+/// while they wait; background work the tool spawns runs between them.
+pub trait ToolInstance: 'static {
+    fn describe(&self) -> Description;
+    /// Settings, named as describe's `config` names them.
+    fn configure(&self, settings: serde_json::Map<String, Value>) -> Result<(), ToolError>;
+    fn invoke(self: Arc<Self>, cx: &Context, command: &str, input: Value) -> LocalFuture<Result<Value, ToolError>>;
+    /// The shared state (with `revision`) and the changes after `since`.
+    fn state(&self, _since: Option<u64>) -> Option<Value> {
+        None
+    }
+    /// The host is going away: stop work in progress.
+    fn shutdown(&self) {}
+    /// The tool's HTTP interface (tool-rest), if it has one.
+    fn http(self: Arc<Self>) -> Option<std::rc::Rc<dyn HttpService>> {
+        None
+    }
+    /// The host wants this instance gone. Ok accepts, keeping a snapshot
+    /// (None: nothing); Err refuses, with the reason. The snapshot is the
+    /// tool's own bytes: plain data, with work in progress described so
+    /// `resume` can start it again. The default refuses.
+    fn suspend(&self, _reason: SuspendReason) -> Result<Option<Vec<u8>>, String> {
+        Err("this tool doesn't support suspending".into())
+    }
+    /// A fresh instance takes up where a suspended one left off, before
+    /// any other call. `listening` is the address the host still serves
+    /// this tool's HTTP interface on, if it does.
+    fn resume(&self, _snapshot: &[u8], _listening: Option<String>) -> Result<(), String> {
+        Err("this tool doesn't support resuming".into())
+    }
+    /// In a component: ask to be suspended (keeping a snapshot) once linear
+    /// memory passes this many bytes, since it never shrinks. Natively the
+    /// allocator returns memory, so it's unused there.
+    fn memory_limit(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// Where a tool keeps its data unless told otherwise: `$<NAME>_DATA_DIR`
+/// (e.g. ANKI_CARDS_DATA_DIR), else the platform's usual place for an app's
+/// data (~/Library/Application Support/NAME on macOS, %APPDATA%\NAME on
+/// Windows, $XDG_DATA_HOME/NAME or ~/.local/share/NAME elsewhere). The
+/// native build uses it by default; a WASM host grants it with `--data`.
+/// Not created here.
+pub fn standard_data_dir(name: &str) -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let var = format!("{}_DATA_DIR", name.to_uppercase().replace('-', "_"));
+    if let Some(d) = std::env::var_os(&var).filter(|d| !d.is_empty()) {
+        return Some(PathBuf::from(d));
+    }
+    if let Some(x) = std::env::var_os("XDG_DATA_HOME").filter(|x| !x.is_empty()) {
+        return Some(PathBuf::from(x).join(name));
+    }
+    if cfg!(windows) {
+        return std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join(name));
+    }
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    Some(if cfg!(target_os = "macos") { home.join("Library/Application Support").join(name) } else { home.join(".local/share").join(name) })
+}
+
 type Handler<T> = Arc<dyn Fn(Arc<T>, Context, Value) -> LocalFuture<Result<Value, ToolError>> + Send + Sync>;
 
 /// One command: its description and its handler.

@@ -2101,7 +2101,10 @@ name = "tool-wasi"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "serde",
+ "serde_json",
  "tool-contract",
+ "tool-ports",
  "tool-rest",
  "wasip3",
  "wit-bindgen",

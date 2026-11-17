@@ -108,6 +108,11 @@ struct Shared {
     serving: Option<tool_serve::Listener>,
     /// The last settings configure accepted, replayed into a fresh instance.
     settings: Option<String>,
+    /// The granted data directory, mounted at /data in each new instance.
+    data_dir: Option<std::path::PathBuf>,
+    /// The next suspend and resume are the host's own housekeeping (a
+    /// re-grant), not worth a log line.
+    quiet: bool,
 }
 
 /// The store's state. `ext` is the extension's: the state behind the
@@ -267,6 +272,9 @@ enum Job {
     /// The host is exiting: ask the program to suspend for the next run
     /// (--snapshot), and answer once the snapshot is saved.
     Persist(Reply<()>),
+    /// Grant this data directory: the instance is suspended (keeping what
+    /// it will) and the next one starts with the grant.
+    Regrant(std::path::PathBuf, Reply<()>),
     McpOut(Writer),
     Subscribe(Arc<dyn Fn(u64) + Send + Sync>),
 }
@@ -321,6 +329,28 @@ impl Wasm {
         rx.recv().expect("the component's thread has stopped")
     }
 
+    /// Calls a command through the component's typed export (describe's
+    /// `wit`), for programs that want it; the generated interfaces use the
+    /// JSON invoke. Records come back with every field, as WIT has them.
+    /// Commands the typed interface doesn't export go through invoke.
+    pub fn invoke_typed(&mut self, cx: &Context, command: &str, input: Value) -> Result<Value, ToolError> {
+        let wcx = wit::Context {
+            by: cx.by.clone(),
+            session: cx.session.clone(),
+            interactive: cx.interactive,
+            request: cx.request.as_ref().map(|r| r.to_string()),
+        };
+        let typed = self.typed.clone();
+        self.ask(|r| Job::Invoke(wcx, command.to_string(), input, typed, r))
+    }
+
+    /// Loads a component as a library would (no command line): for tests
+    /// and programs embedding a tool.
+    pub fn load(path: &str, grants: &Grants, lifecycle: Lifecycle) -> Result<Wasm> {
+        let ext = Extension::none("tool-host");
+        load(path, grants, ext.state, ext.imports, lifecycle)
+    }
+
 }
 
 impl Backend for Wasm {
@@ -343,8 +373,10 @@ impl Backend for Wasm {
             interactive: cx.interactive,
             request: cx.request.as_ref().map(|r| r.to_string()),
         };
-        let typed = self.typed.clone();
-        self.ask(|r| Job::Invoke(wcx, command.to_string(), input, typed, r))
+        // The generated interfaces call the JSON invoke, as the native
+        // build does, so their output is the same in both runtimes (typed
+        // WIT always writes every field). See invoke_typed.
+        self.ask(|r| Job::Invoke(wcx, command.to_string(), input, None, r))
     }
 
     fn shutdown(&mut self) {
@@ -452,7 +484,8 @@ async fn serve_jobs<X: Send + 'static>(
     let mut last_call = Instant::now();
     let mut memory_ask = Instant::now();
     let suspendable = ex.lifecycle.is_some();
-    // What a fresh instance takes, once resumed: the floor for recycling.
+    // What a fresh instance takes, once resumed and warmed up: the floor
+    // for recycling.
     let fresh = a.with(|mut s| s.data_mut().memory.largest);
     let push = |job: Job, running: &mut futures::stream::FuturesUnordered<_>, streams: &mut futures::stream::FuturesUnordered<_>| {
         if matches!(job, Job::Http(..)) { streams.push(run_job(a, ex, job)) } else { running.push(run_job(a, ex, job)) }
@@ -476,6 +509,17 @@ async fn serve_jobs<X: Send + 'static>(
                         Some(keep) => suspending = Some((keep, Some(r))),
                         None => { let _ = r.send(()); }
                     },
+                    Some(Job::Regrant(dir, r)) => {
+                        a.with(|mut s| {
+                            let mut sh = s.data_mut().shared.lock().unwrap();
+                            sh.data_dir = Some(dir);
+                            sh.quiet = true;
+                        });
+                        // Keep what it will; without lifecycle, it has only
+                        // just started, so there's nothing to lose.
+                        let keep = if suspendable { ask_suspend(a, ex, SuspendReason::Exit).await.flatten() } else { None };
+                        suspending = Some((keep, Some(r)));
+                    }
                     Some(job) => push(job, &mut running, &mut streams),
                 }
             }
@@ -552,7 +596,7 @@ async fn run_job<X: Send + 'static>(a: &wasmtime::component::Accessor<State<X>>,
             let _ = r.send(());
         }
         // Handled by serve_jobs.
-        Job::Persist(r) => {
+        Job::Persist(r) | Job::Regrant(_, r) => {
             let _ = r.send(());
         }
         Job::McpOut(out) => a.with(|mut s| s.data_mut().shared.lock().unwrap().mcp_out = Some((out, 0))),
@@ -771,7 +815,7 @@ fn load<X: Send + 'static>(
                     return;
                 }
             };
-            let shared = Arc::new(Mutex::new(Shared::default()));
+            let shared = Arc::new(Mutex::new(Shared { data_dir: grants.data_dir.clone(), ..Default::default() }));
             let mut kept: Option<Vec<u8>> = opts.snapshot_file.as_ref().and_then(|f| std::fs::read(f).ok());
             let mut ready = Some(ready_tx);
             loop {
@@ -788,6 +832,10 @@ fn load<X: Send + 'static>(
                             Some(Job::Shutdown(r) | Job::Persist(r)) => {
                                 let _ = r.send(());
                             }
+                            Some(Job::Regrant(dir, r)) => {
+                                shared.lock().unwrap().data_dir = Some(dir);
+                                let _ = r.send(());
+                            }
                             Some(job) => first = Some(job),
                         }
                     }
@@ -799,7 +847,8 @@ fn load<X: Send + 'static>(
                     // panics.
                     let mut wasi = WasiCtx::builder();
                     wasi.inherit_stderr();
-                    if let Some(dir) = &grants.data_dir {
+                    let data_dir = shared.lock().unwrap().data_dir.clone();
+                    if let Some(dir) = &data_dir {
                         wasi.preopened_dir(dir, DATA_MOUNT, wasmtime_wasi::FsPerms::ReadWrite)
                             .map_err(|e| anyhow!("granting {}: {e:#}", dir.display()))?;
                     }
@@ -863,7 +912,9 @@ fn load<X: Send + 'static>(
                                 let n = snapshot.len();
                                 match l.opinionated_tool_lifecycle().call_resume(a, snapshot, listening).await {
                                     Ok(Ok(())) => {
-                                        log(format!("resumed in {:?} ({n} bytes kept)", started.elapsed()));
+                                        if !std::mem::take(&mut shared.lock().unwrap().quiet) {
+                                            log(format!("resumed in {:?} ({n} bytes kept)", started.elapsed()));
+                                        }
                                         true
                                     }
                                     Ok(Err(e)) => {
@@ -878,6 +929,12 @@ fn load<X: Send + 'static>(
                             }
                             _ => false,
                         };
+                        // When recycling by memory, warm up first (describe
+                        // builds the description, which any first call does),
+                        // so the fresh size it's measured against is real.
+                        if opts.recycle_above.is_some() {
+                            let _ = ex.tool.opinionated_tool_tool().call_describe(a).await;
+                        }
                         // A fresh, empty instance isn't serving: whatever the
                         // socket was for is gone.
                         if !resumed {
@@ -891,11 +948,15 @@ fn load<X: Send + 'static>(
                     Ok(Ok(Outcome::Suspended(keep, reply))) => {
                         let size = store.data().memory.largest;
                         drop(store);
-                        log(format!(
+                        let quiet = shared.lock().unwrap().quiet;
+                        if !quiet { log(format!(
                             "suspended; {} MiB of linear memory released, {} kept",
                             size >> 20,
                             keep.as_ref().map_or("nothing".to_string(), |k| format!("{} bytes", k.len()))
-                        ));
+                        )); }
+                        if keep.is_none() {
+                            shared.lock().unwrap().quiet = false;
+                        }
                         if let Some(f) = &opts.snapshot_file {
                             let saved = match &keep {
                                 Some(k) => std::fs::write(f, k),
@@ -942,17 +1003,19 @@ fn run_inner<X: Send + 'static>(ext: Extension<X>) -> Result<i32> {
     let usage = {
         let extra: String = ext.grant_flags.iter().map(|(f, h)| format!("\n  {f:<24} {h}")).collect();
         format!(
-            "usage: {} [GRANTS]... [LIFECYCLE]... COMPONENT.wasm COMMAND [ARGS]\n\ngrants:\n  --allow-http HOST[:PORT]  let the component make HTTP requests to this host\n  --secret NAME             let the component read NAME from this host's environment\n  --data-dir DIR            let the component keep files in DIR (it sees it as /data){extra}\n\nlifecycle (for components exporting opinionated:tool/lifecycle):\n  --suspend-idle SECS       ask the component to suspend after SECS without calls\n  --recycle-above-mb N      ask it to suspend when its memory passes N MiB; a fresh instance starts small\n  --snapshot FILE           resume from FILE, and ask it to suspend into FILE on exit",
+            "usage: {} [GRANTS]... [LIFECYCLE]... COMPONENT.wasm COMMAND [ARGS]\n\ngrants:\n  --allow-http HOST[:PORT]  let the component make HTTP requests to this host\n  --secret NAME             let the component read NAME from this host's environment\n  --data-dir DIR            let the component keep files in DIR (it sees it as /data)\n  --data                    the same, with the tool's standard data directory (as its native build uses){extra}\n\nlifecycle (for components exporting opinionated:tool/lifecycle):\n  --suspend-idle SECS       ask the component to suspend after SECS without calls\n  --recycle-above-mb N      ask it to suspend when its memory passes N MiB; a fresh instance starts small\n  --snapshot FILE           resume from FILE, and ask it to suspend into FILE on exit",
             ext.name
         )
     };
     let mut args = std::env::args().skip(1);
     let mut grants = Grants::default();
     let mut life = Lifecycle::default();
+    let mut data_standard = false;
     let path = loop {
         match args.next().as_deref() {
             Some("--allow-http") => grants.http.push(args.next().context("--allow-http needs HOST or HOST:PORT")?),
             Some("--secret") => grants.secrets.push(args.next().context("--secret needs a name")?),
+            Some("--data") => data_standard = true,
             Some("--data-dir") => {
                 let dir = std::path::PathBuf::from(args.next().context("--data-dir needs a directory")?);
                 std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -984,6 +1047,13 @@ fn run_inner<X: Send + 'static>(ext: Extension<X>) -> Result<i32> {
         eprintln!("loaded {path} in {:?}", started.elapsed());
     }
     let desc = wasm.describe();
+    if data_standard && grants.data_dir.is_none() {
+        let dir = tool_contract::standard_data_dir(&desc.name).context("no standard data directory here (no HOME); use --data-dir")?;
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        wasm.ask(|r| Job::Regrant(dir.canonicalize().unwrap_or(dir), r));
+    }
+    // Described again: what's available can depend on the grants.
+    let desc = if data_standard { wasm.describe() } else { desc };
 
     // In mcp mode, progress for calls with a progress token goes out as MCP
     // notifications; that routing lives in the store, on the owner thread.

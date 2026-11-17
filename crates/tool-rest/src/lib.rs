@@ -15,25 +15,13 @@ use base64::Engine;
 use futures::stream::{self, Stream, StreamExt};
 use serde_json::{Map, Value, json};
 use tool_contract::{
-    Asset, BodyKind, Category, Context, Description, HttpRequest, LocalFuture, Route, ToolError, codes, render_args,
+    BodyKind, Category, Context, Description, HttpRequest, Route, ToolError, codes, render_args,
     render_commands,
 };
 
-/// What tool-rest needs from the tool, in process.
-pub trait Service {
-    fn invoke(&self, cx: &Context, command: &str, input: Value) -> LocalFuture<Result<Value, ToolError>>;
-    /// The shared state (with `revision`), with the changes after `since`.
-    fn state(&self, since: Option<u64>) -> Option<Value>;
-    /// Resolves once the state's revision is past `after`.
-    fn changed(&self, after: u64) -> LocalFuture<()>;
-    fn sleep(&self, ms: u64) -> LocalFuture<()>;
-    fn asset(&self, path: &str) -> Option<Asset>;
-    /// A page opened (true) or closed (false) the event stream.
-    fn page(&self, connected: bool);
-    /// Whether a request's token is the one the tool issued when it asked
-    /// to be served (false while it isn't served).
-    fn authorized(&self, token: &str) -> bool;
-}
+/// What tool-rest needs from the tool, in process (defined in
+/// tool-contract, where [`tool_contract::ToolInstance`] names it).
+pub use tool_contract::HttpService as Service;
 
 pub enum Body {
     Full(Vec<u8>),

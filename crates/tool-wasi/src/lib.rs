@@ -6,9 +6,23 @@
 //!   converts the request, and streams tool-rest's response back (an event
 //!   stream for as long as the client stays).
 //!
-//! Both are generic; a component's own glue is then a few lines.
+//! - [`export_tool!`]: a ToolInstance as the component, with its ports.
+//!
+//! All generic; a component's own glue is then a few lines.
 
 use std::rc::Rc;
+
+pub mod export;
+
+/// For export_tool!'s expansion, so components needn't name these crates.
+#[doc(hidden)]
+pub mod reexports {
+    pub use serde;
+    pub use serde_json;
+    pub use tool_contract;
+    pub use tool_ports;
+    pub use wasip3;
+}
 
 use tool_contract::{Description, HTTP_DENIED};
 

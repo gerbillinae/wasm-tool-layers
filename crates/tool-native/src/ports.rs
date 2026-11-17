@@ -202,18 +202,8 @@ impl Notify for Subscribers {
     }
 }
 
-/// Where a native tool keeps its data (Ports::data_dir) unless told
-/// otherwise: `$XDG_DATA_HOME/NAME`, else the platform's usual place
-/// (~/Library/Application Support/NAME on macOS, %APPDATA%\NAME on Windows,
-/// ~/.local/share/NAME elsewhere). Not created here.
+/// Where a native tool keeps its data unless told otherwise; see
+/// [`tool_contract::standard_data_dir`].
 pub fn default_data_dir(name: &str) -> Option<std::path::PathBuf> {
-    use std::path::PathBuf;
-    if let Some(x) = std::env::var_os("XDG_DATA_HOME").filter(|x| !x.is_empty()) {
-        return Some(PathBuf::from(x).join(name));
-    }
-    if cfg!(windows) {
-        return std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join(name));
-    }
-    let home = PathBuf::from(std::env::var_os("HOME")?);
-    Some(if cfg!(target_os = "macos") { home.join("Library/Application Support").join(name) } else { home.join(".local/share").join(name) })
+    tool_contract::standard_data_dir(name)
 }
