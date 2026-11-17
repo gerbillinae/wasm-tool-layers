@@ -1,0 +1,12 @@
+[package]
+name = "tool-rest"
+description = "A tool's HTTP interface generated from its description: routes, adaptors, the browser adapters. Runs in the component or on the native core's thread; no sockets, no security checks (the host's listener does those)."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+tool-contract.workspace = true
+serde_json.workspace = true
+base64 = "0.22"
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }

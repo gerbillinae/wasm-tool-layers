@@ -1,0 +1,34 @@
+// Sound on the local machine's speakers: a capability standard WASI doesn't
+// have. Named for the capability, not for anki-cards, so other tools can
+// import it and other hosts provide it.
+package local:audio@0.1.0;
+
+interface player {
+    variant error {
+        /// This host has no audio (e.g. a stub, or a server).
+        unavailable,
+        unsupported-format,
+        device(string),
+    }
+
+    /// A clip that's playing.
+    resource playback {
+        /// Resolves when the clip has finished, or been stopped.
+        finished: async func();
+        stop: func();
+    }
+
+    available: func() -> bool;
+    play: func(data: list<u8>, mime: string) -> result<playback, error>;
+}
+
+/// For hosts' bindings.
+world player-host {
+    import player;
+}
+
+/// A component that implements the player as unavailable, to compose into
+/// a tool so hosts without audio can run it.
+world player-stub {
+    export player;
+}

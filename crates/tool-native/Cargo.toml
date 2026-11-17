@@ -1,0 +1,20 @@
+[package]
+name = "tool-native"
+description = "A tool's native build: its core on an owner thread behind a Backend handle, native port implementations, and the standard CLI (generated commands, describe, mcp, serve)."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tool-contract.workspace = true
+tool-ports.workspace = true
+tool-cli.workspace = true
+tool-mcp.workspace = true
+tool-rest.workspace = true
+tool-serve.workspace = true
+serde_json.workspace = true
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "time", "sync"] }
+ureq = "3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

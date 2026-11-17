@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "crates/tool-audio/stub"]
+# tool-wasi and the audio stub only build for wasm32-wasip2:
+#   cargo build -p tool-wasi -p audio-stub --target wasm32-wasip2
+default-members = [
+    "crates/tool-contract",
+    "crates/tool-ports",
+    "crates/tool-cli",
+    "crates/tool-mcp",
+    "crates/tool-rest",
+    "crates/tool-serve",
+    "crates/tool-native",
+    "crates/tool-host",
+    "crates/tool-audio",
+    "crates/wasm-tool",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+repository = "https://github.com/OWNER/tool-layers"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+schemars = "1"
+clap = { version = "4", features = ["string", "env"] }
+tool-contract = { path = "crates/tool-contract" }
+tool-ports = { path = "crates/tool-ports" }
+tool-cli = { path = "crates/tool-cli" }
+tool-mcp = { path = "crates/tool-mcp" }
+tool-rest = { path = "crates/tool-rest" }
+tool-serve = { path = "crates/tool-serve" }
+tool-host = { path = "crates/tool-host" }

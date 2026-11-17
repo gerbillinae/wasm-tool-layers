@@ -1,0 +1,25 @@
+[package]
+name = "tool-host"
+description = "The generic WASM host as a library: wasm-tool is it with nothing added; tool-specific hosts add imports, grants and commands."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+tool-contract.workspace = true
+tool-cli.workspace = true
+tool-mcp.workspace = true
+tool-serve.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+wasmtime = { version = "50", features = ["component-model-async"] }
+wasmtime-wasi = { version = "50", features = ["p3"] }
+wasmtime-wasi-http = { version = "50", features = ["p3"] }
+http = "1"
+http-body-util = "0.1"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+futures = "0.3"
+bytes = "1"
+base64 = "0.22"

@@ -1,0 +1,15 @@
+[package]
+name = "tool-wasi"
+description = "Guest-side WASI 0.3 glue for tools, wasm32-wasip2 only: an outgoing HTTP client, and serving tool-rest as the component's wasi:http/handler export."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+tool-contract.workspace = true
+tool-rest.workspace = true
+# Must match the host's WASI 0.3 version (wasmtime 50: 0.3.0), and so the
+# component's wit-bindgen (0.62).
+wasip3 = "=0.9.0"
+wit-bindgen = { version = "=0.62.0", features = ["async-spawn", "inter-task-wakeup"] }
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }

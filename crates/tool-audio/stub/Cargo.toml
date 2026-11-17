@@ -1,0 +1,13 @@
+[package]
+name = "audio-stub"
+description = "local:audio/player implemented as unavailable, to compose into a component so hosts without audio can run it. wasm32-wasip2 only."
+edition.workspace = true
+repository.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.62.0"

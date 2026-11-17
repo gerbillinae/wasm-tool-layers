@@ -1,0 +1,15 @@
+[package]
+name = "tool-audio"
+description = "Local audio as a capability: a command-line player, as a native port and as the local:audio/player WIT interface for WASM hosts."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+host = ["dep:tool-host"]
+
+[dependencies]
+tool-ports.workspace = true
+tokio = { version = "1", features = ["time"] }
+tool-host = { workspace = true, optional = true }

@@ -1,0 +1,9 @@
+[package]
+name = "wasm-tool"
+description = "Runs any component implementing opinionated:tool as a CLI or an MCP server: tool-host with nothing added."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+tool-host = { path = "../tool-host" }

@@ -1,0 +1,10 @@
+[package]
+name = "tool-ports"
+description = "The port traits a tool's core reaches the world through: HTTP out, clock, secrets, questions, progress, timers, background work, change notification, serving, audio."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tool-contract.workspace = true

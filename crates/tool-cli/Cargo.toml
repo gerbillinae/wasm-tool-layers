@@ -1,0 +1,11 @@
+[package]
+name = "tool-cli"
+description = "Builds a CLI at run time from a tool's describe(), for wasm-tool and native binaries alike."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+tool-contract.workspace = true
+serde_json.workspace = true
+clap.workspace = true

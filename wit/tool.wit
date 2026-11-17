@@ -1,0 +1,104 @@
+// The contract between a tool's WASM-compatible core and whatever hosts it
+// (wasm-tool, or a tool-specific host). See opinionated/optional/wasm.md.
+//
+// Commands cross as JSON (describe/invoke); capabilities the core needs
+// from its host are typed imports. Outgoing HTTP is standard wasi:http
+// (0.2, blocking), which the component imports through the `wasi` crate;
+// timers are WASI 0.3's async clocks.
+package opinionated:tool@0.1.0;
+
+interface types {
+    record context {
+        /// "terminal", "tui", "mcp" or "web".
+        by: string,
+        session: option<string>,
+        /// Whether someone can answer questions for this call.
+        interactive: bool,
+        /// The interface's handle on this call (e.g. an MCP progress
+        /// token), as JSON, so the host can route progress for it.
+        request: option<string>,
+    }
+
+    record tool-error {
+        code: string,
+        message: string,
+        /// JSON.
+        details: option<string>,
+    }
+}
+
+interface tool {
+    use types.{context, tool-error};
+
+
+    // Every export is async (WASI 0.3, component-model async): calls
+    // interleave with each other and with work the component started
+    // earlier (playback), which keeps running between calls. The host
+    // only has to keep the store's event loop going; it never ticks.
+
+    /// JSON: the tool's description. Callable before configure.
+    describe: async func() -> string;
+    /// JSON object of settings, named as describe's `config` names them.
+    configure: async func(settings: string) -> result<_, tool-error>;
+    /// input and output are JSON.
+    invoke: async func(cx: context, command: string, input: string) -> result<string, tool-error>;
+    /// The host is going away: stop work in progress.
+    shutdown: async func();
+    /// JSON: the shared state, with the changes after `since`; none if the
+    /// tool has no shared state.
+    state: async func(since: option<u64>) -> option<string>;
+}
+
+/// What the core needs from its host, beyond standard WASI.
+interface host {
+    use types.{context, tool-error};
+
+    record secret {
+        value: string,
+        /// Where it came from, for status ("granted", a file).
+        source: string,
+    }
+
+    /// Questions; only called for interactive calls.
+    confirm: func(question: string) -> result<bool, tool-error>;
+    ask: func(question: string) -> result<string, tool-error>;
+    /// Progress for a person, for one call.
+    progress: func(cx: context, message: string);
+    /// A secret the host granted, if any.
+    get-secret: func(name: string) -> option<secret>;
+    /// How to grant a missing secret on this host.
+    secret-hint: func(name: string) -> string;
+    /// The local time zone's offset from UTC at a moment: WASI's clocks are
+    /// UTC only.
+    utc-offset: func(at-ms: s64) -> s32;
+    /// The shared state's revision changed, perhaps by background work
+    /// between calls, so the host can wake whoever is watching.
+    changed: func(revision: u64);
+    /// Serve this component's HTTP interface (its wasi:http/handler export):
+    /// the host listens on 127.0.0.1 (port 0: a free one), checks Origin
+    /// and Host, and forwards; the component checks its own token. Returns
+    /// the address.
+    listen: func(port: u16, allow-origins: list<string>) -> result<string, string>;
+    /// Stop listening; open connections close.
+    unlisten: func();
+}
+
+/// What hosts bind to: the tool interface and the host imports.
+world tool-core {
+    import host;
+    export tool;
+}
+
+/// A tool component: the core, plus its HTTP interface (generated from its
+/// registry, exported as wasi:http/handler). This world describes the whole
+/// component.
+world tool-component {
+    include tool-core;
+    export wasi:http/handler@0.3.0;
+}
+
+/// A tool that can also play sound, through a custom interface.
+world tool-component-audio {
+    include tool-component;
+    import local:audio/player@0.1.0;
+}
