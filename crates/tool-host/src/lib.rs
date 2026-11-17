@@ -344,10 +344,10 @@ impl Wasm {
         self.ask(|r| Job::Invoke(wcx, command.to_string(), input, typed, r))
     }
 
-    /// Loads a component as a library would (no command line): for tests
-    /// and programs embedding a tool.
-    pub fn load(path: &str, grants: &Grants, lifecycle: Lifecycle) -> Result<Wasm> {
-        let ext = Extension::none("tool-host");
+    /// Loads a component as a library would (no command line), with an
+    /// extension's imports (Extension::none for none): for tests and
+    /// programs embedding a tool.
+    pub fn load<X: Send + 'static>(path: &str, grants: &Grants, lifecycle: Lifecycle, ext: Extension<X>) -> Result<Wasm> {
         load(path, grants, ext.state, ext.imports, lifecycle)
     }
 

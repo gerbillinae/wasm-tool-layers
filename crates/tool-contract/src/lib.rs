@@ -113,6 +113,8 @@ pub fn mcp_name(command: &str) -> String {
 }
 
 /// Codes the contract itself uses; tools add their own.
+pub mod conformance;
+
 pub mod codes {
     pub const UNKNOWN_COMMAND: &str = "unknown_command";
     pub const NOT_AVAILABLE_HERE: &str = "not_available_here";
