@@ -2029,6 +2029,8 @@ dependencies = [
  "tool-cli",
  "tool-contract",
  "tool-mcp",
+ "tool-native",
+ "tool-ports",
  "tool-serve",
  "wasmtime",
  "wasmtime-wasi",

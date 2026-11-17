@@ -43,6 +43,9 @@ pub struct Services {
     pub progress: ports::RoutedProgress,
     /// For Ports::data_dir.
     pub data_dir: Option<PathBuf>,
+    /// The tool's declared needs, kept current, for the checked ports
+    /// (UreqHttp::checked, EnvSecrets::checked).
+    pub declared: ports::Declared,
 }
 
 /// How the native build was asked to run (the options before the command).
@@ -92,6 +95,7 @@ pub struct Native<T: ToolInstance> {
     on_change: OnChange,
     /// The last settings configure accepted, replayed into a fresh instance.
     settings: Arc<Mutex<Option<Map<String, Value>>>>,
+    declared: ports::Declared,
 }
 
 /// The call failed because the instance panicked; a fresh one replaced it.
@@ -108,7 +112,10 @@ pub fn start<T: ToolInstance>(opts: &Options, make: impl Fn(Services) -> Arc<T> 
     let settings: Arc<Mutex<Option<Map<String, Value>>>> = Arc::default();
     let (listen_jobs, notify, saved, data_dir) = (jobs.clone(), on_change.clone(), settings.clone(), opts.data_dir.clone());
     let progress = ports::RoutedProgress::default();
+    let declared = ports::Declared::default();
+    let (declared_for_configure, declared_now) = (declared.clone(), declared.clone());
     let services = move || Services {
+        declared: declared.clone(),
         timer: Box::new(ports::TokioTimer),
         spawn: Box::new(ports::LocalSpawn),
         notify: Box::new(ports::Subscribers(notify.clone())),
@@ -122,6 +129,7 @@ pub fn start<T: ToolInstance>(opts: &Options, make: impl Fn(Services) -> Arc<T> 
         local.block_on(&rt, async move {
             let crashed = Arc::new(tokio::sync::Notify::new());
             let mut core = make(services());
+            declared_now.set(core.describe().needs);
             loop {
                 // A crash first: calls after it go to the fresh instance.
                 tokio::select! {
@@ -133,6 +141,7 @@ pub fn start<T: ToolInstance>(opts: &Options, make: impl Fn(Services) -> Arc<T> 
                         if let Some(s) = saved.lock().unwrap().clone() {
                             let _ = core.configure(s);
                         }
+                        declared_now.set(core.describe().needs);
                     }
                     job = rx.recv() => {
                         let Some(job) = job else { break };
@@ -147,7 +156,7 @@ pub fn start<T: ToolInstance>(opts: &Options, make: impl Fn(Services) -> Arc<T> 
             }
         });
     });
-    Native { jobs, on_change, settings }
+    Native { jobs, on_change, settings, declared: declared_for_configure }
 }
 
 impl<T: ToolInstance> Native<T> {
@@ -184,12 +193,14 @@ impl<T: ToolInstance> Backend for Native<T> {
     }
     fn configure(&mut self, config: &Map<String, Value>) -> Result<(), ToolError> {
         let config = config.clone();
-        let saved = self.settings.clone();
+        let (saved, declared) = (self.settings.clone(), self.declared.clone());
         self.call(move |c| {
             Box::pin(async move {
                 let r = c.configure(config.clone());
                 if r.is_ok() {
                     *saved.lock().unwrap() = Some(config);
+                    // Needs can follow config (a server's address).
+                    declared.set(c.describe().needs);
                 }
                 r
             })
@@ -210,7 +221,12 @@ impl<T: ToolInstance> Backend for Native<T> {
         *self.on_change.lock().unwrap() = Some(on_change);
     }
     fn clone_handle(&self) -> Option<Box<dyn Backend + Send>> {
-        Some(Box::new(Native { jobs: self.jobs.clone(), on_change: self.on_change.clone(), settings: self.settings.clone() }))
+        Some(Box::new(Native {
+            jobs: self.jobs.clone(),
+            on_change: self.on_change.clone(),
+            settings: self.settings.clone(),
+            declared: self.declared.clone(),
+        }))
     }
 }
 
@@ -359,7 +375,7 @@ mod crash_tests {
 
     impl ToolInstance for Fragile {
         fn describe(&self) -> Description {
-            serde_json::from_value(json!({"contract": "t", "name": "t", "version": "0", "summary": "", "commands": []})).unwrap()
+            serde_json::from_value(json!({"contract": "t", "name": "t", "version": "0", "summary": "", "commands": [], "errors": {}})).unwrap()
         }
         fn configure(&self, settings: Map<String, Value>) -> Result<(), ToolError> {
             *self.configured.lock().unwrap() = settings.get("x").and_then(|v| v.as_str()).map(String::from);

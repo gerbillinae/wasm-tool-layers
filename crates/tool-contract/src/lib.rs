@@ -324,9 +324,47 @@ pub struct Description {
     pub http: Option<HttpSection>,
     /// The component's typed commands interface (e.g.
     /// "anki:cards/commands@0.1.0"): one typed function per command, named
-    /// as the command. Hosts call those instead of the JSON invoke.
+    /// as the command, for programs that want typed calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wit: Option<String>,
+    /// What the tool reaches beyond itself, given its current config: the
+    /// native build enforces it, and a host can grant it (--grant-declared).
+    #[serde(default, skip_serializing_if = "Needs::is_empty")]
+    pub needs: Needs,
+}
+
+/// A tool's declared capabilities. Some follow from config (AnkiConnect's
+/// address), so describe() after configure has the current ones.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Needs {
+    /// Authorities (host or host:port) it makes HTTP requests to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub http: Vec<String>,
+    /// Secrets it reads, by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
+    /// Whether it keeps data in a directory.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub data: bool,
+}
+
+impl Needs {
+    pub fn is_empty(&self) -> bool {
+        self.http.is_empty() && self.secrets.is_empty() && !self.data
+    }
+
+    /// Whether a request to this authority is declared (host:port, or the
+    /// host alone).
+    pub fn allows_http(&self, authority: &str) -> bool {
+        let host = authority.rsplit_once(':').map_or(authority, |(h, p)| if p.bytes().all(|b| b.is_ascii_digit()) { h } else { authority });
+        self.http.iter().any(|a| a == authority || a == host)
+    }
+}
+
+/// A URL's authority (host, or host:port), for Needs::http.
+pub fn authority_of(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    rest.split(['/', '?', '#']).next().unwrap_or("").rsplit('@').next().unwrap_or("").to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -722,6 +760,7 @@ pub struct Registry<T> {
     pub errors: BTreeMap<String, ErrorInfo>,
     commands: Vec<Command<T>>,
     features: Option<Box<dyn Fn(&T) -> BTreeMap<String, bool> + Send + Sync>>,
+    needs: Option<Box<dyn Fn(&T) -> Needs + Send + Sync>>,
     web_ui: bool,
     wit: Option<String>,
 }
@@ -748,6 +787,7 @@ impl<T: 'static> Registry<T> {
             errors,
             commands: vec![],
             features: None,
+            needs: None,
             web_ui: false,
             wit: None,
         }
@@ -809,6 +849,13 @@ impl<T: 'static> Registry<T> {
         self.errors.insert(code.into(), ErrorInfo { description: description.into(), category });
         self
     }
+    /// What the tool reaches beyond itself, given its current state
+    /// (config): see [`Needs`].
+    pub fn needs(mut self, f: impl Fn(&T) -> Needs + Send + Sync + 'static) -> Self {
+        self.needs = Some(Box::new(f));
+        self
+    }
+
     pub fn features(mut self, f: impl Fn(&T) -> BTreeMap<String, bool> + Send + Sync + 'static) -> Self {
         self.features = Some(Box::new(f));
         self
@@ -831,6 +878,7 @@ impl<T: 'static> Registry<T> {
             errors: self.errors.clone(),
             http: self.web_ui.then(|| HttpSection { routes: self.routes() }),
             wit: self.wit.clone(),
+            needs: self.needs.as_ref().map(|f| f(tool)).unwrap_or_default(),
         }
     }
 

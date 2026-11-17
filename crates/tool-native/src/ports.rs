@@ -8,15 +8,39 @@ use std::time::Duration;
 use tool_contract::{Context, LocalFuture as Future, ToolError};
 use tool_ports::*;
 
+/// The tool's declared needs (describe's `needs`), kept current by
+/// tool-native (at start, and after each configure), for ports that
+/// enforce them natively as a host's grants do in a component.
+#[derive(Clone, Default)]
+pub struct Declared(Arc<std::sync::RwLock<tool_contract::Needs>>);
+
+impl Declared {
+    pub fn get(&self) -> tool_contract::Needs {
+        self.0.read().unwrap().clone()
+    }
+    pub fn set(&self, needs: tool_contract::Needs) {
+        *self.0.write().unwrap() = needs;
+    }
+}
+
 #[derive(Clone)]
 pub struct UreqHttp {
     agent: ureq::Agent,
+    declared: Option<Declared>,
 }
 
 impl UreqHttp {
+    /// Requests to anywhere.
     pub fn new() -> Self {
         let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
-        UreqHttp { agent }
+        UreqHttp { agent, declared: None }
+    }
+
+    /// Requests only to the authorities the tool declared (needs.http),
+    /// refused as a host refuses an ungranted one, so an undeclared
+    /// capability fails natively too, not only in the sandbox.
+    pub fn checked(declared: Declared) -> Self {
+        UreqHttp { declared: Some(declared), ..UreqHttp::new() }
     }
 
     fn blocking(&self, req: &HttpRequest) -> Result<HttpResponse, String> {
@@ -42,6 +66,13 @@ impl UreqHttp {
 
 impl HttpOut for UreqHttp {
     fn send(&self, req: HttpRequest) -> Future<Result<HttpResponse, String>> {
+        if let Some(d) = &self.declared {
+            let authority = tool_contract::authority_of(&req.url);
+            if !d.get().allows_http(&authority) {
+                let msg = format!("{}: {authority} isn't in the tool's declared needs (describe's needs.http)", tool_contract::HTTP_DENIED);
+                return Box::pin(async move { Err(msg) });
+            }
+        }
         let me = self.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || me.blocking(&req)).await.unwrap_or_else(|e| Err(e.to_string()))
@@ -66,11 +97,24 @@ impl Clock for SystemClock {
 /// (by default ~/keys.env).
 pub struct EnvSecrets {
     pub keys_file: Option<std::path::PathBuf>,
+    /// If set, only the secrets the tool declared (needs.secrets).
+    pub declared: Option<Declared>,
 }
 
 impl Default for EnvSecrets {
     fn default() -> Self {
-        EnvSecrets { keys_file: std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join("keys.env")) }
+        EnvSecrets { keys_file: std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join("keys.env")), declared: None }
+    }
+}
+
+impl EnvSecrets {
+    /// The environment and ~/keys.env, for declared secrets only.
+    pub fn checked(declared: Declared) -> Self {
+        EnvSecrets { declared: Some(declared), ..EnvSecrets::default() }
+    }
+
+    fn declares(&self, name: &str) -> bool {
+        self.declared.as_ref().is_none_or(|d| d.get().secrets.iter().any(|s| s == name))
     }
 }
 
@@ -82,6 +126,9 @@ impl EnvSecrets {
 
 impl Secrets for EnvSecrets {
     fn get(&self, name: &str) -> Option<Secret> {
+        if !self.declares(name) {
+            return None;
+        }
         if let Ok(v) = std::env::var(name) {
             if !v.trim().is_empty() {
                 return Some(Secret { value: v.trim().into(), source: "env".into() });
@@ -105,6 +152,9 @@ impl Secrets for EnvSecrets {
     }
 
     fn hint(&self, name: &str) -> String {
+        if !self.declares(name) {
+            return format!("{name} isn't in the tool's declared needs (describe's needs.secrets)");
+        }
         let file = self.keys_file().map(|p| p.display().to_string()).unwrap_or("~/keys.env".into());
         format!("set {name}, or put `{name}=<key>` in {file}")
     }
@@ -206,4 +256,47 @@ impl Notify for Subscribers {
 /// [`tool_contract::standard_data_dir`].
 pub fn default_data_dir(name: &str) -> Option<std::path::PathBuf> {
     tool_contract::standard_data_dir(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn declared(http: &[&str], secrets: &[&str]) -> Declared {
+        let d = Declared::default();
+        d.set(tool_contract::Needs { http: http.iter().map(|s| s.to_string()).collect(), secrets: secrets.iter().map(|s| s.to_string()).collect(), data: false });
+        d
+    }
+
+    #[test]
+    fn undeclared_hosts_are_refused_as_a_host_refuses_them() {
+        let http = UreqHttp::checked(declared(&["127.0.0.1:1"], &[]));
+        let req = HttpRequest { method: "GET".into(), url: "http://example.invalid:2/x".into(), headers: vec![], body: vec![], timeout_ms: 100 };
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let err = rt.block_on(http.send(req)).unwrap_err();
+        assert!(err.starts_with(tool_contract::HTTP_DENIED), "{err}");
+        assert!(err.contains("example.invalid:2"), "{err}");
+    }
+
+    #[test]
+    fn undeclared_secrets_are_withheld() {
+        // SAFETY: a test-only variable, set before any thread reads it.
+        unsafe { std::env::set_var("TOOL_NATIVE_TEST_SECRET", "s3cret") };
+        let open = EnvSecrets { keys_file: None, declared: None };
+        assert!(open.get("TOOL_NATIVE_TEST_SECRET").is_some());
+        let checked = EnvSecrets { keys_file: None, declared: Some(declared(&[], &["OTHER"])) };
+        assert!(checked.get("TOOL_NATIVE_TEST_SECRET").is_none());
+        assert!(checked.hint("TOOL_NATIVE_TEST_SECRET").contains("declared needs"));
+        let allowed = EnvSecrets { keys_file: None, declared: Some(declared(&[], &["TOOL_NATIVE_TEST_SECRET"])) };
+        assert_eq!(allowed.get("TOOL_NATIVE_TEST_SECRET").unwrap().value, "s3cret");
+    }
+
+    #[test]
+    fn authorities() {
+        let n = tool_contract::Needs { http: vec!["127.0.0.1:8765".into(), "texttospeech.googleapis.com".into()], ..Default::default() };
+        assert!(n.allows_http(&tool_contract::authority_of("http://127.0.0.1:8765")));
+        assert!(!n.allows_http(&tool_contract::authority_of("http://127.0.0.1:8766/")));
+        assert!(n.allows_http(&tool_contract::authority_of("https://texttospeech.googleapis.com/v1/text:synthesize?x")));
+        assert!(n.allows_http("texttospeech.googleapis.com:443"));
+    }
 }

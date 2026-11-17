@@ -57,7 +57,8 @@ pub const DATA_MOUNT: &str = "/data";
 /// Outgoing HTTP is checked against the granted authorities before it's
 /// sent.
 struct Hooks {
-    allow: Vec<String>,
+    /// Shared across instances, and extended by --grant-declared.
+    allow: Arc<Mutex<Vec<String>>>,
 }
 
 impl WasiHttpHooks for Hooks {
@@ -79,8 +80,8 @@ impl WasiHttpHooks for Hooks {
     > {
         let authority = request.uri().authority().map(|a| a.to_string()).unwrap_or_default();
         let host = authority.split(':').next().unwrap_or("").to_string();
-        if !self.allow.iter().any(|a| *a == authority || *a == host) {
-            eprintln!("refused HTTP to {authority} (grant it with --allow-http {authority})");
+        if !self.allow.lock().unwrap().iter().any(|a| *a == authority || *a == host) {
+            eprintln!("refused HTTP to {authority} (grant it with --allow-http {authority}, or --grant-declared if the tool declares it)");
             return Box::new(async { Err(wasmtime_wasi_http::Error::HttpRequestDenied) });
         }
         Box::new(async move {
@@ -122,7 +123,8 @@ pub struct State<X: 'static> {
     http: WasiHttpCtx,
     table: ResourceTable,
     hooks: Hooks,
-    secrets: Vec<String>,
+    /// Granted secret names; shared across instances.
+    secrets: Arc<Mutex<Vec<String>>>,
     shared: Arc<Mutex<Shared>>,
     /// For serving the component's HTTP export: the queue to its thread
     /// (None if it has no export).
@@ -198,22 +200,25 @@ impl<X> opinionated::tool::host::Host for State<X> {
         eprintln!("{message}");
     }
 
+    /// A granted secret, from where the native build reads it (the
+    /// environment, then ~/keys.env), so granting gives the component what
+    /// the native build would have.
     fn get_secret(&mut self, name: String) -> Option<opinionated::tool::host::Secret> {
-        if !self.secrets.contains(&name) {
+        use tool_ports::Secrets as _;
+        if !self.secrets.lock().unwrap().contains(&name) {
             return None;
         }
-        let value = std::env::var(&name).ok().filter(|v| !v.trim().is_empty())?;
-        Some(opinionated::tool::host::Secret {
-            value: value.trim().into(),
-            source: format!("granted ({name} from the host's environment)"),
-        })
+        tool_native::ports::EnvSecrets::default()
+            .get(&name)
+            .map(|s| opinionated::tool::host::Secret { value: s.value, source: s.source })
     }
 
     fn secret_hint(&mut self, name: String) -> String {
-        if self.secrets.contains(&name) {
-            format!("{name} is granted, but the host's environment doesn't set it")
+        use tool_ports::Secrets as _;
+        if self.secrets.lock().unwrap().contains(&name) {
+            tool_native::ports::EnvSecrets::default().hint(&name)
         } else {
-            format!("grant it with --secret {name}, with {name} set in the host's environment")
+            format!("grant it with --secret {name} (or --grant-declared), with {name} set in the environment or ~/keys.env")
         }
     }
 
@@ -289,6 +294,11 @@ pub struct Wasm {
     typed: Option<String>,
     /// Whether the component exports wasi:http/handler.
     has_http: bool,
+    /// What's granted, shared with the instances (--grant-declared adds).
+    granted_http: Arc<Mutex<Vec<String>>>,
+    granted_secrets: Arc<Mutex<Vec<String>>>,
+    /// Grant what the tool declares (describe's needs), as config changes it.
+    grant_declared: bool,
 }
 
 /// Forwards checked requests to the component's HTTP export.
@@ -329,6 +339,23 @@ impl Wasm {
         rx.recv().expect("the component's thread has stopped")
     }
 
+    /// Grants HTTP and secrets the tool declared (not the data directory,
+    /// which needs a fresh instance: see run's --grant-declared).
+    pub fn grant(&self, needs: &tool_contract::Needs) {
+        let mut http = self.granted_http.lock().unwrap();
+        for a in &needs.http {
+            if !http.contains(a) {
+                http.push(a.clone());
+            }
+        }
+        let mut secrets = self.granted_secrets.lock().unwrap();
+        for s in &needs.secrets {
+            if !secrets.contains(s) {
+                secrets.push(s.clone());
+            }
+        }
+    }
+
     /// Calls a command through the component's typed export (describe's
     /// `wit`), for programs that want it; the generated interfaces use the
     /// JSON invoke. Records come back with every field, as WIT has them.
@@ -363,7 +390,13 @@ impl Backend for Wasm {
 
     fn configure(&mut self, config: &Map<String, Value>) -> Result<(), ToolError> {
         let settings = Value::Object(config.clone()).to_string();
-        self.ask(|r| Job::Configure(settings, r))
+        self.ask(|r| Job::Configure(settings, r))?;
+        if self.grant_declared {
+            // Needs can follow config (a server's address).
+            let needs = self.describe().needs;
+            self.grant(&needs);
+        }
+        Ok(())
     }
 
     fn invoke(&mut self, cx: &Context, command: &str, input: Value) -> Result<Value, ToolError> {
@@ -394,7 +427,14 @@ impl Backend for Wasm {
     }
 
     fn clone_handle(&self) -> Option<Box<dyn Backend + Send>> {
-        Some(Box::new(Wasm { jobs: self.jobs.clone(), typed: self.typed.clone(), has_http: self.has_http }))
+        Some(Box::new(Wasm {
+            jobs: self.jobs.clone(),
+            typed: self.typed.clone(),
+            has_http: self.has_http,
+            granted_http: self.granted_http.clone(),
+            granted_secrets: self.granted_secrets.clone(),
+            grant_declared: self.grant_declared,
+        }))
     }
 }
 
@@ -788,6 +828,9 @@ fn load<X: Send + 'static>(
 ) -> Result<Wasm> {
     let (jobs, mut rx) = tokio::sync::mpsc::unbounded_channel::<Job>();
     let http_jobs = jobs.clone();
+    let granted_http = Arc::new(Mutex::new(grants.http.clone()));
+    let granted_secrets = Arc::new(Mutex::new(grants.secrets.clone()));
+    let (handle_http, handle_secrets) = (granted_http.clone(), granted_secrets.clone());
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<bool>>();
     let (path, grants) = (path.to_string(), grants.clone());
     std::thread::spawn(move || {
@@ -817,6 +860,7 @@ fn load<X: Send + 'static>(
             };
             let shared = Arc::new(Mutex::new(Shared { data_dir: grants.data_dir.clone(), ..Default::default() }));
             let mut kept: Option<Vec<u8>> = opts.snapshot_file.as_ref().and_then(|f| std::fs::read(f).ok());
+            let (allow, secrets) = (granted_http.clone(), granted_secrets.clone());
             let mut ready = Some(ready_tx);
             loop {
                 // After the first instance, start one only when a job needs
@@ -858,8 +902,8 @@ fn load<X: Send + 'static>(
                         wasi,
                         http: WasiHttpCtx::new(),
                         table: ResourceTable::new(),
-                        hooks: Hooks { allow: grants.http.clone() },
-                        secrets: grants.secrets.clone(),
+                        hooks: Hooks { allow: allow.clone() },
+                        secrets: secrets.clone(),
                         shared: shared.clone(),
                         http_jobs: None,
                         suspend_request: None,
@@ -983,7 +1027,7 @@ fn load<X: Send + 'static>(
         });
     });
     let has_http = ready_rx.recv().map_err(|_| anyhow!("the component's thread stopped while loading"))??;
-    Ok(Wasm { jobs, typed: None, has_http })
+    Ok(Wasm { jobs, typed: None, has_http, granted_http: handle_http, granted_secrets: handle_secrets, grant_declared: false })
 }
 
 /// Runs the host: parses grants, loads the component named on the command
@@ -1003,7 +1047,7 @@ fn run_inner<X: Send + 'static>(ext: Extension<X>) -> Result<i32> {
     let usage = {
         let extra: String = ext.grant_flags.iter().map(|(f, h)| format!("\n  {f:<24} {h}")).collect();
         format!(
-            "usage: {} [GRANTS]... [LIFECYCLE]... COMPONENT.wasm COMMAND [ARGS]\n\ngrants:\n  --allow-http HOST[:PORT]  let the component make HTTP requests to this host\n  --secret NAME             let the component read NAME from this host's environment\n  --data-dir DIR            let the component keep files in DIR (it sees it as /data)\n  --data                    the same, with the tool's standard data directory (as its native build uses){extra}\n\nlifecycle (for components exporting opinionated:tool/lifecycle):\n  --suspend-idle SECS       ask the component to suspend after SECS without calls\n  --recycle-above-mb N      ask it to suspend when its memory passes N MiB; a fresh instance starts small\n  --snapshot FILE           resume from FILE, and ask it to suspend into FILE on exit",
+            "usage: {} [GRANTS]... [LIFECYCLE]... COMPONENT.wasm COMMAND [ARGS]\n\ngrants:\n  --allow-http HOST[:PORT]  let the component make HTTP requests to this host\n  --secret NAME             let the component read NAME from this host's environment\n  --data-dir DIR            let the component keep files in DIR (it sees it as /data)\n  --data                    the same, with the tool's standard data directory (as its native build uses)\n  --grant-declared          grant what the tool declares it needs (describe's needs: HTTP hosts, secrets, data){extra}\n\nlifecycle (for components exporting opinionated:tool/lifecycle):\n  --suspend-idle SECS       ask the component to suspend after SECS without calls\n  --recycle-above-mb N      ask it to suspend when its memory passes N MiB; a fresh instance starts small\n  --snapshot FILE           resume from FILE, and ask it to suspend into FILE on exit",
             ext.name
         )
     };
@@ -1011,11 +1055,13 @@ fn run_inner<X: Send + 'static>(ext: Extension<X>) -> Result<i32> {
     let mut grants = Grants::default();
     let mut life = Lifecycle::default();
     let mut data_standard = false;
+    let mut grant_declared = false;
     let path = loop {
         match args.next().as_deref() {
             Some("--allow-http") => grants.http.push(args.next().context("--allow-http needs HOST or HOST:PORT")?),
             Some("--secret") => grants.secrets.push(args.next().context("--secret needs a name")?),
             Some("--data") => data_standard = true,
+            Some("--grant-declared") => grant_declared = true,
             Some("--data-dir") => {
                 let dir = std::path::PathBuf::from(args.next().context("--data-dir needs a directory")?);
                 std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -1047,6 +1093,22 @@ fn run_inner<X: Send + 'static>(ext: Extension<X>) -> Result<i32> {
         eprintln!("loaded {path} in {:?}", started.elapsed());
     }
     let desc = wasm.describe();
+    if grant_declared {
+        // What the tool says it needs, granted explicitly: HTTP and secrets
+        // now (and again after configure, as config moves them), and the
+        // data directory as --data would.
+        wasm.grant_declared = true;
+        wasm.grant(&desc.needs);
+        data_standard |= desc.needs.data;
+        let n = &desc.needs;
+        eprintln!(
+            "{}: granting what the tool declares: HTTP to [{}], secrets [{}]{}",
+            ext.name,
+            n.http.join(", "),
+            n.secrets.join(", "),
+            if n.data { ", its data directory" } else { "" }
+        );
+    }
     if data_standard && grants.data_dir.is_none() {
         let dir = tool_contract::standard_data_dir(&desc.name).context("no standard data directory here (no HOME); use --data-dir")?;
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;

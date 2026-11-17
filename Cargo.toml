@@ -30,6 +30,7 @@ schemars = "1"
 clap = { version = "4", features = ["string", "env"] }
 tool-contract = { path = "crates/tool-contract" }
 tool-ports = { path = "crates/tool-ports" }
+tool-native = { path = "crates/tool-native" }
 tool-cli = { path = "crates/tool-cli" }
 tool-mcp = { path = "crates/tool-mcp" }
 tool-rest = { path = "crates/tool-rest" }

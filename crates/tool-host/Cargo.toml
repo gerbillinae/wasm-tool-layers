@@ -10,6 +10,9 @@ tool-contract.workspace = true
 tool-cli.workspace = true
 tool-mcp.workspace = true
 tool-serve.workspace = true
+# Its EnvSecrets: granted secrets come from where the native build reads them.
+tool-native.workspace = true
+tool-ports.workspace = true
 serde_json.workspace = true
 clap.workspace = true
 anyhow = "1"

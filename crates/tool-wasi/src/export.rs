@@ -155,7 +155,10 @@ macro_rules! export_tool {
                 // The description first: the fresh size includes it.
                 ::std::sync::LazyLock::force(&__DESC);
                 ::std::sync::LazyLock::force(&__FRESH);
-                $crate::reexports::serde_json::to_string(&*__DESC).unwrap_or_default()
+                // Fresh each time: features and needs can follow config.
+                // (__DESC, for routing, keeps the routes, which don't.)
+                let desc = $crate::reexports::tool_contract::ToolInstance::describe(&**__TOOL);
+                $crate::reexports::serde_json::to_string(&desc).unwrap_or_default()
             }
 
             async fn configure(settings: String) -> Result<(), opinionated::tool::types::ToolError> {
