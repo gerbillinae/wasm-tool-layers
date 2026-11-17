@@ -375,7 +375,12 @@ impl Wasm {
     /// extension's imports (Extension::none for none): for tests and
     /// programs embedding a tool.
     pub fn load<X: Send + 'static>(path: &str, grants: &Grants, lifecycle: Lifecycle, ext: Extension<X>) -> Result<Wasm> {
-        load(path, grants, ext.state, ext.imports, lifecycle)
+        load(Source::File(path.into()), grants, ext.state, ext.imports, lifecycle)
+    }
+
+    /// The same, for a component compiled into the program.
+    pub fn load_bytes<X: Send + 'static>(bytes: &'static [u8], grants: &Grants, lifecycle: Lifecycle, ext: Extension<X>) -> Result<Wasm> {
+        load(Source::Bytes(bytes), grants, ext.state, ext.imports, lifecycle)
     }
 
 }
@@ -822,8 +827,24 @@ fn encode(s: &str) -> String {
 /// once; instances come and go: a suspended one is dropped, and the next
 /// job that needs the component starts a fresh one, configured as the last
 /// was and resumed from the snapshot.
+/// Where the component comes from: a file, or bytes compiled into the host.
+#[derive(Clone)]
+pub enum Source {
+    File(String),
+    Bytes(&'static [u8]),
+}
+
+impl Source {
+    fn name(&self) -> String {
+        match self {
+            Source::File(p) => p.clone(),
+            Source::Bytes(_) => "the embedded component".into(),
+        }
+    }
+}
+
 fn load<X: Send + 'static>(
-    path: &str,
+    source: Source,
     grants: &Grants,
     state: Box<dyn Fn(&Grants) -> X + Send>,
     imports: AddImports<X>,
@@ -835,7 +856,7 @@ fn load<X: Send + 'static>(
     let granted_secrets = Arc::new(Mutex::new(grants.secrets.clone()));
     let (handle_http, handle_secrets) = (granted_http.clone(), granted_secrets.clone());
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<bool>>();
-    let (path, grants) = (path.to_string(), grants.clone());
+    let grants = grants.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("a tokio runtime");
         rt.block_on(async move {
@@ -854,7 +875,11 @@ fn load<X: Send + 'static>(
                     }
                 }
                 let engine = Engine::new(&config).map_err(w)?;
-                let component = Component::from_file(&engine, &path).map_err(|e| anyhow!("loading {path}: {e:#}"))?;
+                let component = match &source {
+                    Source::File(path) => Component::from_file(&engine, path),
+                    Source::Bytes(bytes) => Component::new(&engine, bytes),
+                }
+                .map_err(|e| anyhow!("loading {}: {e:#}", source.name()))?;
                 let mut linker: Linker<State<X>> = Linker::new(&engine);
                 wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(w)?;
                 wasmtime_wasi::p3::add_to_linker(&mut linker).map_err(w)?;
@@ -1046,7 +1071,30 @@ fn load<X: Send + 'static>(
 /// Runs the host: parses grants, loads the component named on the command
 /// line, and hands the rest of the arguments to the generated CLI.
 pub fn run<X: Send + 'static>(ext: Extension<X>) -> ! {
-    match run_inner(ext) {
+    finish(run_inner(ext, None))
+}
+
+/// A tool's own binary, built from its component alone: the component's
+/// bytes compiled in (see its build script), run as if this were the
+/// tool's native build. The command line is the tool's own (`TOOL COMMAND
+/// [ARGS]`, no component path), with the host's grant and lifecycle flags
+/// before the command. `default_flags` are given unless
+/// `--no-default-grants` is: for a first-party component, typically
+/// `--grant-declared` (what it declares, nothing more) and its extension's
+/// grants (`--audio`).
+pub struct Embedded {
+    pub wasm: &'static [u8],
+    /// Instructions for MCP clients.
+    pub instructions: Option<String>,
+    pub default_flags: Vec<String>,
+}
+
+pub fn run_embedded<X: Send + 'static>(ext: Extension<X>, embedded: Embedded) -> ! {
+    finish(run_inner(ext, Some(embedded)))
+}
+
+fn finish(r: Result<i32>) -> ! {
+    match r {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             println!("{}", json!({"error": {"code": "host_error", "message": format!("{e:#}")}}));
@@ -1056,20 +1104,45 @@ pub fn run<X: Send + 'static>(ext: Extension<X>) -> ! {
     }
 }
 
-fn run_inner<X: Send + 'static>(ext: Extension<X>) -> Result<i32> {
+fn run_inner<X: Send + 'static>(ext: Extension<X>, embedded: Option<Embedded>) -> Result<i32> {
     let usage = {
         let extra: String = ext.grant_flags.iter().map(|(f, h)| format!("\n  {f:<24} {h}")).collect();
+        let what = if embedded.is_some() { "" } else { "COMPONENT.wasm " };
+        let defaults = embedded.as_ref().map_or(String::new(), |e| {
+            format!("\n  --no-default-grants       don't grant the defaults ({})", e.default_flags.join(" "))
+        });
         format!(
-            "usage: {} [GRANTS]... [LIFECYCLE]... COMPONENT.wasm COMMAND [ARGS]\n\ngrants:\n  --allow-http HOST[:PORT]  let the component make HTTP requests to this host\n  --secret NAME             let the component read NAME from this host's environment\n  --data-dir DIR            let the component keep files in DIR (it sees it as /data)\n  --data                    the same, with the tool's standard data directory (as its native build uses)\n  --grant-declared          grant what the tool declares it needs (describe's needs: HTTP hosts, secrets, data){extra}\n\nlifecycle (for components exporting opinionated:tool/lifecycle):\n  --suspend-idle SECS       ask the component to suspend after SECS without calls\n  --recycle-above-mb N      ask it to suspend when its memory passes N MiB; a fresh instance starts small\n  --snapshot FILE           resume from FILE, and ask it to suspend into FILE on exit\n\nother:\n  --no-cache                compile the component every run (the compilation cache is on by default)",
+            "usage: {} [GRANTS]... [LIFECYCLE]... {what}COMMAND [ARGS]\n\ngrants:\n  --allow-http HOST[:PORT]  let the component make HTTP requests to this host\n  --secret NAME             let the component read NAME from this host's environment\n  --data-dir DIR            let the component keep files in DIR (it sees it as /data)\n  --data                    the same, with the tool's standard data directory (as its native build uses)\n  --grant-declared          grant what the tool declares it needs (describe's needs: HTTP hosts, secrets, data){defaults}{extra}\n\nlifecycle (for components exporting opinionated:tool/lifecycle):\n  --suspend-idle SECS       ask the component to suspend after SECS without calls\n  --recycle-above-mb N      ask it to suspend when its memory passes N MiB; a fresh instance starts small\n  --snapshot FILE           resume from FILE, and ask it to suspend into FILE on exit\n\nother:\n  --no-cache                compile the component every run (the compilation cache is on by default)",
             ext.name
         )
     };
-    let mut args = std::env::args().skip(1);
+    let mut given: Vec<String> = std::env::args().skip(1).collect();
+    // A tool's own binary: its default grants first, unless refused.
+    let mut defaulted: Vec<String> = vec![];
+    if let Some(e) = &embedded {
+        if let Some(i) = given.iter().position(|a| a == "--no-default-grants") {
+            given.remove(i);
+        } else {
+            defaulted = e.default_flags.clone();
+        }
+    }
+    let explicit_grant_declared = given.iter().any(|a| a == "--grant-declared");
+    let mut args = defaulted.into_iter().chain(given).peekable();
     let mut grants = Grants::default();
     let mut life = Lifecycle::default();
     let mut data_standard = false;
     let mut grant_declared = false;
-    let path = loop {
+    let source = loop {
+        // A tool's own binary has no component path: the first argument
+        // that isn't a host flag starts the tool's command line (which
+        // handles its own --help).
+        if embedded.is_some() {
+            match args.peek().map(String::as_str) {
+                None | Some("-h" | "--help") => break Source::Bytes(embedded.as_ref().unwrap().wasm),
+                Some(a) if !a.starts_with('-') => break Source::Bytes(embedded.as_ref().unwrap().wasm),
+                _ => {}
+            }
+        }
         match args.next().as_deref() {
             Some("--allow-http") => grants.http.push(args.next().context("--allow-http needs HOST or HOST:PORT")?),
             Some("--secret") => grants.secrets.push(args.next().context("--secret needs a name")?),
@@ -1090,21 +1163,26 @@ fn run_inner<X: Send + 'static>(ext: Extension<X>) -> Result<i32> {
             }
             Some("--snapshot") => life.snapshot_file = Some(args.next().context("--snapshot needs a file")?.into()),
             Some("--no-cache") => life.no_cache = true,
+            Some("--host-help") => {
+                eprintln!("{usage}");
+                return Ok(0);
+            }
             Some("-h" | "--help") | None => {
                 eprintln!("{usage}");
                 return Ok(0);
             }
             Some(f) if ext.grant_flags.iter().any(|(g, _)| g == f) => grants.flags.push(f.to_string()),
             Some(p) if p.starts_with('-') => bail!("unknown option {p}\n\n{usage}"),
-            Some(p) => break p.to_string(),
+            Some(p) => break Source::File(p.to_string()),
         }
     };
     let rest: Vec<String> = args.collect();
     let started = std::time::Instant::now();
     let persist = life.snapshot_file.is_some();
-    let mut wasm = load(&path, &grants, ext.state, ext.imports, life)?;
+    let name = source.name();
+    let mut wasm = load(source, &grants, ext.state, ext.imports, life)?;
     if std::env::var_os("TOOL_HOST_TIMING").is_some() {
-        eprintln!("loaded {path} in {:?}", started.elapsed());
+        eprintln!("loaded {name} in {:?}", started.elapsed());
     }
     let desc = wasm.describe();
     if grant_declared {
@@ -1115,13 +1193,14 @@ fn run_inner<X: Send + 'static>(ext: Extension<X>) -> Result<i32> {
         wasm.grant(&desc.needs);
         data_standard |= desc.needs.data;
         let n = &desc.needs;
-        eprintln!(
+        // Said when asked for; a tool's own binary does it every run.
+        if explicit_grant_declared || embedded.is_none() { eprintln!(
             "{}: granting what the tool declares: HTTP to [{}], secrets [{}]{}",
             ext.name,
             n.http.join(", "),
             n.secrets.join(", "),
             if n.data { ", its data directory" } else { "" }
-        );
+        ); }
     }
     if data_standard && grants.data_dir.is_none() {
         let dir = tool_contract::standard_data_dir(&desc.name).context("no standard data directory here (no HOME); use --data-dir")?;
@@ -1134,7 +1213,8 @@ fn run_inner<X: Send + 'static>(ext: Extension<X>) -> Result<i32> {
     // In mcp mode, progress for calls with a progress token goes out as MCP
     // notifications; that routing lives in the store, on the owner thread.
     let jobs = wasm.jobs.clone();
-    let mcp = tool_mcp::mcp_command(&ext.name, None, Box::new(move |out| {
+    let instructions = embedded.as_ref().and_then(|e| e.instructions.clone());
+    let mcp = tool_mcp::mcp_command(&ext.name, instructions, Box::new(move |out| {
         let _ = jobs.send(Job::McpOut(out));
     }));
     let mut customs = vec![tool_cli::describe_command(), mcp, tool_serve::command(&ext.name)];

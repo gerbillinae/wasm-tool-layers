@@ -75,6 +75,18 @@ wit_bindgen::generate!({ world: "my:tool/component", path: "wit", with: { … },
 tool_wasi::export_tool!(Component, MyTool, || MyTool::new(host_ports()));
 ```
 
+### Or skip the native build
+
+A tool can ship as its component alone, in one binary: a build script compiles the component (a second cargo, its own target directory), the bytes are embedded, and `tool_host::run_embedded` runs them with the tool's own command line (`TOOL COMMAND`, no component path). Its default grants (typically `--grant-declared` and its extension's flags) apply unless `--no-default-grants`; `--host-help` lists the host's flags. The core is then only ever built for WASM. anki-cards-rs's [`wasm-only` branch](https://github.com/gerbillinae/anki-cards-rs/tree/wasm-only) does this.
+
+```rust
+tool_host::run_embedded(extension, tool_host::Embedded {
+    wasm: my_tool_wasm::WASM,                 // include_bytes! of what build.rs built
+    instructions: Some(MCP_INSTRUCTIONS.into()),
+    default_flags: vec!["--grant-declared".into()],
+})
+```
+
 ## Declared needs
 
 A tool declares what it reaches beyond itself (`Registry::needs`), computed from its config: HTTP authorities, secret names, a data directory. They're in `describe()`. The native build enforces them (`UreqHttp::checked`, `EnvSecrets::checked`), so an undeclared capability fails in development, not only in the sandbox. A host grants them only when asked: `--grant-declared`. Granted secrets come from where the native build reads them (the environment, then `~/keys.env`).
