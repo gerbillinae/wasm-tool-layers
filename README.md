@@ -45,7 +45,7 @@ tool_native::run(backend, progress, tool_native::App { name: "my-tool", instruct
 
 ## Suspend and resume
 
-A component that exports `opinionated:tool/lifecycle` can be suspended: the host discards the instance and later starts a fresh one from a snapshot the program chose to keep. The snapshot is opaque bytes; the program picks the format (anki-cards uses rkyv). Either side can start it:
+A component that exports `opinionated:tool/lifecycle` can be suspended: the host discards the instance and later starts a fresh one from a snapshot the program chose to keep. The snapshot is opaque bytes; the program picks the format. postcard is the recommendation: compact binary serde, several times faster and smaller than JSON. Its types must write every field, so no `skip_serializing_if`. Either side can start it:
 
 - **The program:** `host.request-suspend(snapshot)`, at any point.
 - **The host:** `suspend(reason)`, with reason `idle`, `memory` or `exit`. The program accepts with a snapshot, or refuses with a reason, for example while audio plays.
