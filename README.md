@@ -1,8 +1,8 @@
-# tool-layers
+# wasm-tool-layers
 
 Rust libraries for building a tool once and offering it as a CLI, an MCP server, a REST API with a web UI, and optionally a sandboxed WebAssembly component, all generated from one description of its commands.
 
-The design and its reasoning are in [opinionated/optional/wasm.md](https://github.com/OWNER/opinionated/blob/main/optional/wasm.md). A complete example tool is anki-cards (`language-teacher/tools/anki-cards-rs`).
+The design and its reasoning are in [opinionated/optional/wasm.md](https://github.com/gerbillinae/opinionated/blob/main/optional/wasm.md). A complete example tool is anki-cards (`language-teacher/tools/anki-cards-rs`).
 
 ## The crates
 
@@ -28,10 +28,10 @@ Each crate is its own dependency, from this one repository. Use the same tag for
 
 ```toml
 [dependencies]
-tool-contract = { git = "https://github.com/OWNER/tool-layers", tag = "v0.1.0" }
-tool-ports    = { git = "https://github.com/OWNER/tool-layers", tag = "v0.1.0" }
-tool-rest     = { git = "https://github.com/OWNER/tool-layers", tag = "v0.1.0" }
-tool-native   = { git = "https://github.com/OWNER/tool-layers", tag = "v0.1.0" }
+tool-contract = { git = "https://github.com/gerbillinae/wasm-tool-layers", tag = "v0.1.0" }
+tool-ports    = { git = "https://github.com/gerbillinae/wasm-tool-layers", tag = "v0.1.0" }
+tool-rest     = { git = "https://github.com/gerbillinae/wasm-tool-layers", tag = "v0.1.0" }
+tool-native   = { git = "https://github.com/gerbillinae/wasm-tool-layers", tag = "v0.1.0" }
 ```
 
 A native tool's `main` is its ports plus one call:

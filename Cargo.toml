@@ -20,7 +20,7 @@ default-members = [
 edition = "2024"
 version = "0.1.0"
 license = "MIT"
-repository = "https://github.com/OWNER/tool-layers"
+repository = "https://github.com/gerbillinae/wasm-tool-layers"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
