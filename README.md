@@ -16,7 +16,7 @@ The design and its reasoning are in [opinionated/optional/wasm.md](https://githu
 | `tool-serve` | hosts | The listening socket (hyper): localhost only, Origin and Host checks, forwarding with a "client gone" signal; the `serve` command |
 | `tool-native` | native builds | The core on an owner thread behind a `Backend` handle, native port implementations, and the standard CLI (`run`) |
 | `tool-wasi` | components | WASI 0.3 glue: an async HTTP client, and serving `tool-rest` as `wasi:http/handler` |
-| `tool-host` | WASM hosts | The generic host as a library (wasmtime): grants, the owner thread, typed command calls, and extensions for custom capabilities |
+| `tool-host` | WASM hosts | The generic host as a library (wasmtime): grants, the owner thread, typed command calls, suspend and resume, and extensions for custom capabilities |
 | `wasm-tool` | users | `tool-host` with nothing added: runs any tool component |
 | `tool-audio` | tools that play sound | A command-line player, as a native port and (feature `host`) as the `local:audio/player` WIT interface; `stub/` is a component that implements it as unavailable |
 
@@ -41,6 +41,21 @@ let progress = tool_native::ports::RoutedProgress::default();
 let p = progress.clone();
 let backend = tool_native::start(move |services| Arc::new(MyTool::new(my_ports(p, services))));
 tool_native::run(backend, progress, tool_native::App { name: "my-tool", instructions: None, commands: vec![] });
+```
+
+## Suspend and resume
+
+A component that exports `opinionated:tool/lifecycle` can be suspended: the host discards the instance and later starts a fresh one from a snapshot the program chose to keep. The snapshot is opaque bytes; the program picks the format (anki-cards uses rkyv). Either side can start it:
+
+- **The program:** `host.request-suspend(snapshot)`, at any point.
+- **The host:** `suspend(reason)`, with reason `idle`, `memory` or `exit`. The program accepts with a snapshot, or refuses with a reason, for example while audio plays.
+
+The fresh instance is configured as before, then given the snapshot (`resume`) before any other call. The host's socket, MCP output and subscribers outlive instances. Host flags:
+
+```
+--suspend-idle SECS       ask the component to suspend after SECS without calls
+--recycle-above-mb N      ask it to suspend when its memory passes N MiB (and twice a fresh instance's)
+--snapshot FILE           resume from FILE, and ask it to suspend into FILE on exit
 ```
 
 ## Versions

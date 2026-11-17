@@ -25,6 +25,13 @@ use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpHooks, WasiHttpVi
 // wasmtime-wasi-http's own bindings.
 wasmtime::component::bindgen!({ world: "tool-core", path: "../../wit" });
 
+/// The optional lifecycle export (suspend and resume), bound on its own so
+/// components without it still load.
+mod lifecycle {
+    wasmtime::component::bindgen!({ world: "tool-lifecycle", path: "../../wit" });
+    pub use exports::opinionated::tool::lifecycle::{SuspendReason, SuspendReply};
+}
+
 mod typed;
 
 use opinionated::tool::types as wit;
@@ -83,6 +90,21 @@ impl WasiHttpHooks for Hooks {
 
 type Writer = Arc<Mutex<std::io::Stdout>>;
 
+/// What outlives an instance: when one is suspended and a fresh one
+/// started, these carry over (the socket stays open, MCP keeps its output).
+#[derive(Default)]
+struct Shared {
+    /// Set in mcp mode: progress for calls with a progress token goes out
+    /// as MCP notifications.
+    mcp_out: Option<(Writer, u64)>,
+    /// Told new revisions (Backend::subscribe).
+    listener: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    /// The running listener for the component's HTTP export.
+    serving: Option<tool_serve::Listener>,
+    /// The last settings configure accepted, replayed into a fresh instance.
+    settings: Option<String>,
+}
+
 /// The store's state. `ext` is the extension's: the state behind the
 /// imports it added.
 pub struct State<X: 'static> {
@@ -91,16 +113,32 @@ pub struct State<X: 'static> {
     table: ResourceTable,
     hooks: Hooks,
     secrets: Vec<String>,
-    /// Set in mcp mode: progress for calls with a progress token goes out
-    /// as MCP notifications.
-    mcp_out: Option<(Writer, u64)>,
-    /// Told new revisions (Backend::subscribe).
-    listener: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    shared: Arc<Mutex<Shared>>,
     /// For serving the component's HTTP export: the queue to its thread
-    /// (None if it has no export), and the running listener.
+    /// (None if it has no export).
     http_jobs: Option<tokio::sync::mpsc::UnboundedSender<Job>>,
-    serving: Option<tool_serve::Listener>,
+    /// The program asked to be suspended (request-suspend), keeping this.
+    suspend_request: Option<Option<Vec<u8>>>,
+    suspend_wake: Arc<tokio::sync::Notify>,
+    /// The size of the instance's largest linear memory, in bytes.
+    memory: MemoryWatch,
     pub ext: X,
+}
+
+/// Watches linear memory growth (it never shrinks), for recycling.
+#[derive(Default)]
+struct MemoryWatch {
+    largest: usize,
+}
+
+impl wasmtime::ResourceLimiter for MemoryWatch {
+    fn memory_growing(&mut self, _current: usize, desired: usize, _maximum: Option<usize>) -> wasmtime::Result<bool> {
+        self.largest = self.largest.max(desired);
+        Ok(true)
+    }
+    fn table_growing(&mut self, _current: usize, _desired: usize, _maximum: Option<usize>) -> wasmtime::Result<bool> {
+        Ok(true)
+    }
 }
 
 impl<X: Send> WasiView for State<X> {
@@ -139,7 +177,8 @@ impl<X> opinionated::tool::host::Host for State<X> {
 
     fn progress(&mut self, cx: wit::Context, message: String) {
         let token = cx.request.and_then(|r| serde_json::from_str::<Value>(&r).ok());
-        if let (Some((out, n)), Some(token)) = (self.mcp_out.as_mut(), token) {
+        let mut shared = self.shared.lock().unwrap();
+        if let (Some((out, n)), Some(token)) = (shared.mcp_out.as_mut(), token) {
             *n += 1;
             let mut o = out.lock().unwrap();
             let _ = writeln!(o, "{}", tool_mcp::progress_notification(&token, *n, &message));
@@ -169,22 +208,28 @@ impl<X> opinionated::tool::host::Host for State<X> {
     }
 
     fn changed(&mut self, revision: u64) {
-        if let Some(f) = &self.listener {
+        let f = self.shared.lock().unwrap().listener.clone();
+        if let Some(f) = f {
             f(revision);
         }
     }
 
     fn listen(&mut self, port: u16, allow_origins: Vec<String>) -> Result<String, String> {
         let jobs = self.http_jobs.clone().ok_or("this component has no HTTP interface")?;
-        self.serving = None;
+        self.shared.lock().unwrap().serving = None;
         let l = tool_serve::listen(Arc::new(WasmHttp { jobs }), port, allow_origins)?;
         let url = l.url.clone();
-        self.serving = Some(l);
+        self.shared.lock().unwrap().serving = Some(l);
         Ok(url)
     }
 
     fn unlisten(&mut self) {
-        self.serving = None;
+        self.shared.lock().unwrap().serving = None;
+    }
+
+    fn request_suspend(&mut self, snapshot: Option<Vec<u8>>) {
+        self.suspend_request = Some(snapshot);
+        self.suspend_wake.notify_one();
     }
 
     fn utc_offset(&mut self, at_ms: i64) -> i32 {
@@ -214,6 +259,9 @@ enum Job {
         futures::channel::mpsc::Sender<Vec<u8>>,
     ),
     Shutdown(Reply<()>),
+    /// The host is exiting: ask the program to suspend for the next run
+    /// (--snapshot), and answer once the snapshot is saved.
+    Persist(Reply<()>),
     McpOut(Writer),
     Subscribe(Arc<dyn Fn(u64) + Send + Sync>),
 }
@@ -313,72 +361,195 @@ impl Backend for Wasm {
     }
 }
 
+/// When the host suspends instances, besides when the program asks.
+#[derive(Debug, Default, Clone)]
+pub struct Lifecycle {
+    /// Ask the program to suspend after this long without calls.
+    pub idle: Option<std::time::Duration>,
+    /// Ask the program to suspend when its linear memory passes this many
+    /// bytes, so a fresh instance starts small. Only when it's at least
+    /// twice what the instance had once resumed: below that, a fresh one
+    /// wouldn't be much smaller, and recycling would thrash.
+    pub recycle_above: Option<usize>,
+    /// Keep the snapshot here, so the next run resumes from it.
+    pub snapshot_file: Option<std::path::PathBuf>,
+}
+
+/// How long to wait before asking again after a refusal for memory.
+const MEMORY_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Why an instance's event loop ended.
+enum Outcome {
+    /// Every handle is gone: the host is exiting.
+    Closed,
+    /// Suspended, keeping this; answer the reply once it's saved.
+    Suspended(Option<Vec<u8>>, Option<Reply<()>>),
+}
+
+/// The instance's exports.
+struct Exports {
+    tool: ToolCore,
+    instance: wasmtime::component::Instance,
+    http: Option<wasmtime_wasi_http::p3::bindings::Service>,
+    lifecycle: Option<lifecycle::ToolLifecycle>,
+}
+
+fn log(message: impl std::fmt::Display) {
+    eprintln!("tool-host: {message}");
+}
+
+/// Asks the program to suspend; Some(what it keeps) if it agreed.
+async fn ask_suspend<X: Send + 'static>(
+    a: &wasmtime::component::Accessor<State<X>>,
+    ex: &Exports,
+    reason: lifecycle::SuspendReason,
+) -> Option<Option<Vec<u8>>> {
+    let l = ex.lifecycle.as_ref()?;
+    match l.opinionated_tool_lifecycle().call_suspend(a, reason).await {
+        Ok(lifecycle::SuspendReply::Accept(keep)) => Some(keep),
+        Ok(lifecycle::SuspendReply::Refuse(why)) => {
+            let why_asked = match reason {
+                lifecycle::SuspendReason::Idle => "idle",
+                lifecycle::SuspendReason::Memory => "memory",
+                lifecycle::SuspendReason::Exit => "exit",
+            };
+            log(format!("asked to suspend ({why_asked}), the program refused: {why}"));
+            None
+        }
+        Err(e) => {
+            log(format!("suspend failed: {e:#}"));
+            None
+        }
+    }
+}
+
 /// The owner thread's loop, inside the store's event loop: each queued
 /// call runs concurrently (a call waiting on HTTP doesn't hold up the
-/// others), and the component's own tasks run alongside.
+/// others), and the component's own tasks run alongside. It ends when the
+/// handles are gone, or the instance is suspended: then calls in progress
+/// finish, open HTTP streams are dropped, and later jobs wait in the queue
+/// for the next instance.
 async fn serve_jobs<X: Send + 'static>(
     a: &wasmtime::component::Accessor<State<X>>,
-    tool: &ToolCore,
-    instance: &wasmtime::component::Instance,
-    http: Option<&wasmtime_wasi_http::p3::bindings::Service>,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<Job>,
-) -> wasmtime::Result<()> {
+    ex: &Exports,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Job>,
+    first: Option<Job>,
+    opts: &Lifecycle,
+    wake: Arc<tokio::sync::Notify>,
+) -> wasmtime::Result<Outcome> {
     use futures::StreamExt;
+    use lifecycle::SuspendReason;
+    use std::time::Instant;
     let mut running = futures::stream::FuturesUnordered::new();
+    // HTTP requests, apart: an event stream never ends by itself.
+    let mut streams = futures::stream::FuturesUnordered::new();
+    let mut suspending: Option<(Option<Vec<u8>>, Option<Reply<()>>)> = None;
+    let mut last_call = Instant::now();
+    let mut memory_ask = Instant::now();
+    let suspendable = ex.lifecycle.is_some();
+    // What a fresh instance takes, once resumed: the floor for recycling.
+    let fresh = a.with(|mut s| s.data_mut().memory.largest);
+    let push = |job: Job, running: &mut futures::stream::FuturesUnordered<_>, streams: &mut futures::stream::FuturesUnordered<_>| {
+        if matches!(job, Job::Http(..)) { streams.push(run_job(a, ex, job)) } else { running.push(run_job(a, ex, job)) }
+    };
+    if let Some(job) = first {
+        push(job, &mut running, &mut streams);
+    }
     loop {
+        if suspending.is_some() && running.is_empty() {
+            let (keep, reply) = suspending.take().unwrap();
+            return Ok(Outcome::Suspended(keep, reply));
+        }
+        let idle_at = opts.idle.map(|d| tokio::time::Instant::from_std(last_call + d));
+        let watch_idle = suspendable && idle_at.is_some() && running.is_empty() && suspending.is_none();
         tokio::select! {
-            job = rx.recv() => match job {
-                Some(job) => running.push(run_job(a, tool, instance, http, job)),
-                None => break,
-            },
-            Some(()) = running.next(), if !running.is_empty() => {}
+            job = rx.recv(), if suspending.is_none() => {
+                last_call = Instant::now();
+                match job {
+                    None => break,
+                    Some(Job::Persist(r)) => match ask_suspend(a, ex, SuspendReason::Exit).await {
+                        Some(keep) => suspending = Some((keep, Some(r))),
+                        None => { let _ = r.send(()); }
+                    },
+                    Some(job) => push(job, &mut running, &mut streams),
+                }
+            }
+            Some(()) = running.next(), if !running.is_empty() => {
+                last_call = Instant::now();
+                let size = a.with(|mut s| s.data_mut().memory.largest);
+                let over = opts.recycle_above.is_some_and(|limit| size > limit && size >= 2 * fresh);
+                if over && suspendable && running.is_empty() && suspending.is_none() && Instant::now() >= memory_ask {
+                    match ask_suspend(a, ex, SuspendReason::Memory).await {
+                        Some(keep) => {
+                            log(format!("recycling: linear memory is {} MiB", size >> 20));
+                            suspending = Some((keep, None));
+                        }
+                        None => memory_ask = Instant::now() + MEMORY_RETRY,
+                    }
+                }
+            }
+            Some(()) = streams.next(), if !streams.is_empty() => {}
+            () = wake.notified() => {
+                if let Some(keep) = a.with(|mut s| s.data_mut().suspend_request.take()) {
+                    if suspendable && suspending.is_none() {
+                        log("the program asked to be suspended");
+                        suspending = Some((keep, None));
+                    }
+                }
+            }
+            () = tokio::time::sleep_until(idle_at.unwrap_or_else(tokio::time::Instant::now)), if watch_idle => {
+                match ask_suspend(a, ex, SuspendReason::Idle).await {
+                    Some(keep) => suspending = Some((keep, None)),
+                    None => last_call = Instant::now(),
+                }
+            }
         }
     }
     while running.next().await.is_some() {}
-    Ok(())
+    Ok(Outcome::Closed)
 }
 
-async fn run_job<X: Send + 'static>(
-    a: &wasmtime::component::Accessor<State<X>>,
-    tool: &ToolCore,
-    instance: &wasmtime::component::Instance,
-    http: Option<&wasmtime_wasi_http::p3::bindings::Service>,
-    job: Job,
-) {
-    let t = tool.opinionated_tool_tool();
-    {
-        match job {
-            Job::Describe(r) => {
-                let _ = r.send(t.call_describe(a).await.unwrap_or_default());
-            }
-            Job::Configure(settings, r) => {
-                let _ = r.send(t.call_configure(a, settings).await.map_err(trap).and_then(|x| x.map_err(from_wit_err)));
-            }
-            Job::Invoke(cx, command, input, Some(iface), r) => {
-                let _ = r.send(typed_invoke(a, instance, &iface, cx, &command, input).await);
-            }
-            Job::Invoke(cx, command, input, None, r) => {
-                let out = t.call_invoke(a, cx, command, input.to_string()).await.map_err(trap).and_then(|x| x.map_err(from_wit_err));
-                let _ = r.send(out.and_then(|s| {
-                    serde_json::from_str(&s).map_err(|e| ToolError::new("internal", format!("the component's result isn't JSON: {e}")))
-                }));
-            }
-            Job::State(since, r) => {
-                let text = t.call_state(a, since).await.ok().flatten();
-                let _ = r.send(text.and_then(|t| serde_json::from_str(&t).ok()));
-            }
-            Job::Http(req, gone, head, chunks) => {
-                if let Some(service) = http {
-                    forward(a, service, req, gone, head, chunks).await;
-                }
-            }
-            Job::Shutdown(r) => {
-                let _ = t.call_shutdown(a).await;
-                let _ = r.send(());
-            }
-            Job::McpOut(out) => a.with(|mut s| s.data_mut().mcp_out = Some((out, 0))),
-            Job::Subscribe(f) => a.with(|mut s| s.data_mut().listener = Some(f)),
+async fn run_job<X: Send + 'static>(a: &wasmtime::component::Accessor<State<X>>, ex: &Exports, job: Job) {
+    let t = ex.tool.opinionated_tool_tool();
+    match job {
+        Job::Describe(r) => {
+            let _ = r.send(t.call_describe(a).await.unwrap_or_default());
         }
+        Job::Configure(settings, r) => {
+            let out = t.call_configure(a, settings.clone()).await.map_err(trap).and_then(|x| x.map_err(from_wit_err));
+            if out.is_ok() {
+                a.with(|mut s| s.data_mut().shared.lock().unwrap().settings = Some(settings));
+            }
+            let _ = r.send(out);
+        }
+        Job::Invoke(cx, command, input, Some(iface), r) => {
+            let _ = r.send(typed_invoke(a, &ex.instance, &iface, cx, &command, input).await);
+        }
+        Job::Invoke(cx, command, input, None, r) => {
+            let out = t.call_invoke(a, cx, command, input.to_string()).await.map_err(trap).and_then(|x| x.map_err(from_wit_err));
+            let _ = r.send(out.and_then(|s| {
+                serde_json::from_str(&s).map_err(|e| ToolError::new("internal", format!("the component's result isn't JSON: {e}")))
+            }));
+        }
+        Job::State(since, r) => {
+            let text = t.call_state(a, since).await.ok().flatten();
+            let _ = r.send(text.and_then(|t| serde_json::from_str(&t).ok()));
+        }
+        Job::Http(req, gone, head, chunks) => {
+            if let Some(service) = &ex.http {
+                forward(a, service, req, gone, head, chunks).await;
+            }
+        }
+        Job::Shutdown(r) => {
+            let _ = t.call_shutdown(a).await;
+            let _ = r.send(());
+        }
+        // Handled by serve_jobs.
+        Job::Persist(r) => {
+            let _ = r.send(());
+        }
+        Job::McpOut(out) => a.with(|mut s| s.data_mut().shared.lock().unwrap().mcp_out = Some((out, 0))),
+        Job::Subscribe(f) => a.with(|mut s| s.data_mut().shared.lock().unwrap().listener = Some(f)),
     }
 }
 
@@ -394,8 +565,9 @@ pub struct Extension<X: 'static> {
     /// Grant flags it accepts, with their help (e.g. ("--audio", "let the
     /// tool play sound")). Given ones arrive in [`Grants::flags`].
     pub grant_flags: Vec<(String, String)>,
-    /// Makes the extension's state, knowing what was granted.
-    pub state: Box<dyn FnOnce(&Grants) -> X + Send>,
+    /// Makes the extension's state, knowing what was granted: once per
+    /// instance (a suspended one is replaced by a fresh one).
+    pub state: Box<dyn Fn(&Grants) -> X + Send>,
     /// Adds the extension's imports to the linker.
     pub imports: AddImports<X>,
     /// Custom commands, given the component's description.
@@ -543,9 +715,18 @@ fn encode(s: &str) -> String {
 }
 
 /// Starts the owner thread, which loads the component and then serves
-/// jobs until the handle is dropped.
-fn load<X: Send + 'static>(path: &str, grants: &Grants, state: Box<dyn FnOnce(&Grants) -> X + Send>, imports: AddImports<X>) -> Result<Wasm> {
-    let (jobs, rx) = tokio::sync::mpsc::unbounded_channel::<Job>();
+/// jobs until the handle is dropped. Engine, linker and component are made
+/// once; instances come and go: a suspended one is dropped, and the next
+/// job that needs the component starts a fresh one, configured as the last
+/// was and resumed from the snapshot.
+fn load<X: Send + 'static>(
+    path: &str,
+    grants: &Grants,
+    state: Box<dyn Fn(&Grants) -> X + Send>,
+    imports: AddImports<X>,
+    opts: Lifecycle,
+) -> Result<Wasm> {
+    let (jobs, mut rx) = tokio::sync::mpsc::unbounded_channel::<Job>();
     let http_jobs = jobs.clone();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<bool>>();
     let (path, grants) = (path.to_string(), grants.clone());
@@ -553,7 +734,7 @@ fn load<X: Send + 'static>(path: &str, grants: &Grants, state: Box<dyn FnOnce(&G
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("a tokio runtime");
         rt.block_on(async move {
             let w = |e: wasmtime::Error| anyhow!("{e:#}");
-            let setup = async {
+            let setup = || -> Result<_> {
                 let mut config = wasmtime::Config::new();
                 config.wasm_component_model_async(true);
                 let engine = Engine::new(&config).map_err(w)?;
@@ -565,43 +746,153 @@ fn load<X: Send + 'static>(path: &str, grants: &Grants, state: Box<dyn FnOnce(&G
                 wasmtime_wasi_http::p3::add_to_linker(&mut linker).map_err(w)?;
                 ToolCore::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s).map_err(w)?;
                 imports(&mut linker).map_err(w)?;
-                // No files, no environment, no sockets: only stderr, for
-                // the component's own panics.
-                let wasi = WasiCtx::builder().inherit_stderr().build();
-                let data = State {
-                    wasi,
-                    http: WasiHttpCtx::new(),
-                    table: ResourceTable::new(),
-                    hooks: Hooks { allow: grants.http.clone() },
-                    secrets: grants.secrets.clone(),
-                    mcp_out: None,
-                    listener: None,
-                    http_jobs: None,
-                    serving: None,
-                    ext: state(&grants),
-                };
-                let mut store = Store::new(&engine, data);
-                let instance = linker.instantiate_async(&mut store, &component).await.map_err(|e| {
-                    anyhow!("{e:#}. If the component imports an interface this host doesn't provide, run it with a host that does, or compose a stub for it in.")
-                })?;
-                let tool = ToolCore::new(&mut store, &instance).map_err(w)?;
-                let instance_handle = instance;
-                // The component's HTTP interface, if it exports one.
-                let http = wasmtime_wasi_http::p3::bindings::Service::new(&mut store, &instance).ok();
-                if http.is_some() {
-                    store.data_mut().http_jobs = Some(http_jobs.clone());
-                }
-                Ok::<_, anyhow::Error>((store, tool, instance_handle, http))
+                Ok((engine, component, linker))
             };
-            match setup.await {
+            let (engine, component, linker) = match setup() {
+                Ok(x) => x,
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
+                    return;
                 }
-                Ok((mut store, tool, instance, http)) => {
-                    let _ = ready_tx.send(Ok(http.is_some()));
-                    let result = store.run_concurrent(async |a| serve_jobs(a, &tool, &instance, http.as_ref(), rx).await).await;
-                    if let Err(e) | Ok(Err(e)) = result.map(|r| r.map(|_| ())) {
-                        eprintln!("the component stopped: {e:#}");
+            };
+            let shared = Arc::new(Mutex::new(Shared::default()));
+            let mut kept: Option<Vec<u8>> = opts.snapshot_file.as_ref().and_then(|f| std::fs::read(f).ok());
+            let mut ready = Some(ready_tx);
+            loop {
+                // After the first instance, start one only when a job needs
+                // the component.
+                let mut first = None;
+                if ready.is_none() {
+                    while first.is_none() {
+                        match rx.recv().await {
+                            None => return,
+                            Some(Job::McpOut(o)) => shared.lock().unwrap().mcp_out = Some((o, 0)),
+                            Some(Job::Subscribe(f)) => shared.lock().unwrap().listener = Some(f),
+                            // Suspended: nothing running, the snapshot saved.
+                            Some(Job::Shutdown(r) | Job::Persist(r)) => {
+                                let _ = r.send(());
+                            }
+                            Some(job) => first = Some(job),
+                        }
+                    }
+                }
+                let started = std::time::Instant::now();
+                let instantiate = async {
+                    // No files, no environment, no sockets: only stderr, for
+                    // the component's own panics.
+                    let wasi = WasiCtx::builder().inherit_stderr().build();
+                    let wake = Arc::new(tokio::sync::Notify::new());
+                    let data = State {
+                        wasi,
+                        http: WasiHttpCtx::new(),
+                        table: ResourceTable::new(),
+                        hooks: Hooks { allow: grants.http.clone() },
+                        secrets: grants.secrets.clone(),
+                        shared: shared.clone(),
+                        http_jobs: None,
+                        suspend_request: None,
+                        suspend_wake: wake.clone(),
+                        memory: MemoryWatch::default(),
+                        ext: state(&grants),
+                    };
+                    let mut store = Store::new(&engine, data);
+                    store.limiter(|s| &mut s.memory);
+                    let instance = linker.instantiate_async(&mut store, &component).await.map_err(|e| {
+                        anyhow!("{e:#}. If the component imports an interface this host doesn't provide, run it with a host that does, or compose a stub for it in.")
+                    })?;
+                    let tool = ToolCore::new(&mut store, &instance).map_err(w)?;
+                    // The component's HTTP interface and lifecycle, if it
+                    // exports them.
+                    let http = wasmtime_wasi_http::p3::bindings::Service::new(&mut store, &instance).ok();
+                    if http.is_some() {
+                        store.data_mut().http_jobs = Some(http_jobs.clone());
+                    }
+                    let lifecycle = lifecycle::ToolLifecycle::new(&mut store, &instance).ok();
+                    Ok::<_, anyhow::Error>((store, Exports { tool, instance, http, lifecycle }, wake))
+                };
+                let (mut store, ex, wake) = match instantiate.await {
+                    Ok(x) => x,
+                    Err(e) => {
+                        match ready.take() {
+                            Some(r) => {
+                                let _ = r.send(Err(e));
+                            }
+                            None => log(format!("couldn't start a fresh instance: {e:#}")),
+                        }
+                        return;
+                    }
+                };
+                if let Some(r) = ready.take() {
+                    let _ = r.send(Ok(ex.http.is_some()));
+                }
+                let resuming = kept.take();
+                let result = store
+                    .run_concurrent(async |a| {
+                        let settings = shared.lock().unwrap().settings.clone();
+                        if let Some(settings) = settings {
+                            if let Err(e) = ex.tool.opinionated_tool_tool().call_configure(a, settings).await {
+                                log(format!("replaying configure failed: {e:#}"));
+                            }
+                        }
+                        let listening = shared.lock().unwrap().serving.as_ref().map(|l| l.url.clone());
+                        let resumed = match (resuming, &ex.lifecycle) {
+                            (Some(snapshot), Some(l)) => {
+                                let n = snapshot.len();
+                                match l.opinionated_tool_lifecycle().call_resume(a, snapshot, listening).await {
+                                    Ok(Ok(())) => {
+                                        log(format!("resumed in {:?} ({n} bytes kept)", started.elapsed()));
+                                        true
+                                    }
+                                    Ok(Err(e)) => {
+                                        log(format!("the program couldn't resume, so it starts empty: {e}"));
+                                        false
+                                    }
+                                    Err(e) => {
+                                        log(format!("resume failed, so the instance starts empty: {e:#}"));
+                                        false
+                                    }
+                                }
+                            }
+                            _ => false,
+                        };
+                        // A fresh, empty instance isn't serving: whatever the
+                        // socket was for is gone.
+                        if !resumed {
+                            shared.lock().unwrap().serving = None;
+                        }
+                        serve_jobs(a, &ex, &mut rx, first, &opts, wake).await
+                    })
+                    .await;
+                match result {
+                    Ok(Ok(Outcome::Closed)) => return,
+                    Ok(Ok(Outcome::Suspended(keep, reply))) => {
+                        let size = store.data().memory.largest;
+                        drop(store);
+                        log(format!(
+                            "suspended; {} MiB of linear memory released, {} kept",
+                            size >> 20,
+                            keep.as_ref().map_or("nothing".to_string(), |k| format!("{} bytes", k.len()))
+                        ));
+                        if let Some(f) = &opts.snapshot_file {
+                            let saved = match &keep {
+                                Some(k) => std::fs::write(f, k),
+                                None => std::fs::remove_file(f).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }),
+                            };
+                            if let Err(e) = saved {
+                                log(format!("couldn't save the snapshot to {}: {e}", f.display()));
+                            }
+                        }
+                        kept = keep;
+                        if let Some(r) = reply {
+                            let _ = r.send(());
+                        }
+                    }
+                    Ok(Err(e)) | Err(e) => {
+                        // A trap: the instance is unusable and its state is
+                        // gone. The next job starts a fresh one.
+                        log(format!("the component stopped: {e:#}"));
+                        kept = None;
+                        shared.lock().unwrap().serving = None;
                     }
                 }
             }
@@ -628,16 +919,26 @@ fn run_inner<X: Send + 'static>(ext: Extension<X>) -> Result<i32> {
     let usage = {
         let extra: String = ext.grant_flags.iter().map(|(f, h)| format!("\n  {f:<24} {h}")).collect();
         format!(
-            "usage: {} [GRANTS]... COMPONENT.wasm COMMAND [ARGS]\n\ngrants:\n  --allow-http HOST[:PORT]  let the component make HTTP requests to this host\n  --secret NAME             let the component read NAME from this host's environment{extra}",
+            "usage: {} [GRANTS]... [LIFECYCLE]... COMPONENT.wasm COMMAND [ARGS]\n\ngrants:\n  --allow-http HOST[:PORT]  let the component make HTTP requests to this host\n  --secret NAME             let the component read NAME from this host's environment{extra}\n\nlifecycle (for components exporting opinionated:tool/lifecycle):\n  --suspend-idle SECS       ask the component to suspend after SECS without calls\n  --recycle-above-mb N      ask it to suspend when its memory passes N MiB; a fresh instance starts small\n  --snapshot FILE           resume from FILE, and ask it to suspend into FILE on exit",
             ext.name
         )
     };
     let mut args = std::env::args().skip(1);
     let mut grants = Grants::default();
+    let mut life = Lifecycle::default();
     let path = loop {
         match args.next().as_deref() {
             Some("--allow-http") => grants.http.push(args.next().context("--allow-http needs HOST or HOST:PORT")?),
             Some("--secret") => grants.secrets.push(args.next().context("--secret needs a name")?),
+            Some("--suspend-idle") => {
+                let secs: f64 = args.next().context("--suspend-idle needs seconds")?.parse().context("--suspend-idle needs seconds")?;
+                life.idle = Some(std::time::Duration::from_secs_f64(secs));
+            }
+            Some("--recycle-above-mb") => {
+                let mb: usize = args.next().context("--recycle-above-mb needs a number")?.parse().context("--recycle-above-mb needs a number")?;
+                life.recycle_above = Some(mb << 20);
+            }
+            Some("--snapshot") => life.snapshot_file = Some(args.next().context("--snapshot needs a file")?.into()),
             Some("-h" | "--help") | None => {
                 eprintln!("{usage}");
                 return Ok(0);
@@ -649,7 +950,8 @@ fn run_inner<X: Send + 'static>(ext: Extension<X>) -> Result<i32> {
     };
     let rest: Vec<String> = args.collect();
     let started = std::time::Instant::now();
-    let mut wasm = load(&path, &grants, ext.state, ext.imports)?;
+    let persist = life.snapshot_file.is_some();
+    let mut wasm = load(&path, &grants, ext.state, ext.imports, life)?;
     if std::env::var_os("TOOL_HOST_TIMING").is_some() {
         eprintln!("loaded {path} in {:?}", started.elapsed());
     }
@@ -663,5 +965,9 @@ fn run_inner<X: Send + 'static>(ext: Extension<X>) -> Result<i32> {
     }));
     let mut customs = vec![tool_cli::describe_command(), mcp, tool_serve::command(&ext.name)];
     customs.extend((ext.commands)(&desc));
-    Ok(tool_cli::run(&desc, rest, &mut wasm, customs))
+    let code = tool_cli::run(&desc, rest, &mut wasm, customs);
+    if persist {
+        wasm.ask(Job::Persist);
+    }
+    Ok(code)
 }

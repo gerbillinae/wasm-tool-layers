@@ -81,12 +81,57 @@ interface host {
     listen: func(port: u16, allow-origins: list<string>) -> result<string, string>;
     /// Stop listening; open connections close.
     unlisten: func();
+    /// Suspend this instance: the host lets calls in progress finish, drops
+    /// open HTTP streams, and discards the instance. The next call starts a
+    /// fresh one, configured as before and given `snapshot` (lifecycle's
+    /// `resume`). The bytes are opaque to the host: the program decides
+    /// what to keep, and changes made after this call are lost. Without a
+    /// snapshot, the fresh instance starts empty. Only for components that
+    /// export lifecycle; a host without suspend support ignores it.
+    request-suspend: func(snapshot: option<list<u8>>);
+}
+
+/// Suspend and resume, exported by components that support them. The host
+/// asks the program to suspend (to shed memory, when idle, or before it
+/// exits); the program may refuse, for a reason (audio is playing). A
+/// fresh instance is given the snapshot before any other call.
+interface lifecycle {
+    enum suspend-reason {
+        /// Nothing has called for a while.
+        idle,
+        /// The instance's memory has grown past the host's limit; a fresh
+        /// one starts small.
+        memory,
+        /// The host is exiting; the snapshot is saved for the next run.
+        exit,
+    }
+
+    variant suspend-reply {
+        /// Suspend, keeping this (none: keep nothing).
+        accept(option<list<u8>>),
+        /// Keep running; why, for the host's log.
+        refuse(string),
+    }
+
+    suspend: async func(reason: suspend-reason) -> suspend-reply;
+    /// Called on a fresh instance before anything else, with what the last
+    /// one kept. `listening` is the address the host is still serving this
+    /// component's HTTP interface on, if it is (the socket outlives
+    /// instances, but not the host process). An error starts the instance
+    /// empty.
+    resume: async func(snapshot: list<u8>, listening: option<string>) -> result<_, string>;
 }
 
 /// What hosts bind to: the tool interface and the host imports.
 world tool-core {
     import host;
     export tool;
+}
+
+/// For hosts: the optional lifecycle export, bound separately so
+/// components without it still load.
+world tool-lifecycle {
+    export lifecycle;
 }
 
 /// A tool component: the core, plus its HTTP interface (generated from its
