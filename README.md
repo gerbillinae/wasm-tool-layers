@@ -2,7 +2,7 @@
 
 Rust libraries for building a tool once and offering it as a CLI, an MCP server, a REST API with a web UI, and optionally a sandboxed WebAssembly component, all generated from one description of its commands. The native build and the component run the same code the same way, and a conformance suite checks that they do.
 
-The design and its reasoning are in [opinionated/optional/wasm.md](https://github.com/gerbillinae/opinionated/blob/main/optional/wasm.md). A complete example tool is anki-cards (`language-teacher/tools/anki-cards-rs`).
+The design and its reasoning are in [opinionated/optional/wasm.md](https://github.com/gerbillinae/opinionated/blob/main/optional/wasm.md). A complete example tool is [anki-cards-rs](https://github.com/gerbillinae/anki-cards-rs).
 
 ## The shape
 
