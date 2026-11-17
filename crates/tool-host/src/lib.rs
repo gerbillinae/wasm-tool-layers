@@ -450,6 +450,9 @@ pub struct Lifecycle {
     pub recycle_above: Option<usize>,
     /// Keep the snapshot here, so the next run resumes from it.
     pub snapshot_file: Option<std::path::PathBuf>,
+    /// Don't use wasmtime's compilation cache (on by default: a one-shot
+    /// CLI run otherwise compiles the whole component every time).
+    pub no_cache: bool,
 }
 
 /// How long to wait before asking again after a refusal for memory.
@@ -840,6 +843,16 @@ fn load<X: Send + 'static>(
             let setup = || -> Result<_> {
                 let mut config = wasmtime::Config::new();
                 config.wasm_component_model_async(true);
+                if !opts.no_cache {
+                    // Compiled code on disk, keyed by the component and the
+                    // engine's settings, in the platform's cache folder.
+                    match wasmtime::Cache::new(wasmtime::CacheConfig::new()) {
+                        Ok(cache) => {
+                            config.cache(Some(cache));
+                        }
+                        Err(e) => log(format!("no compilation cache ({e:#}); compiling every run")),
+                    }
+                }
                 let engine = Engine::new(&config).map_err(w)?;
                 let component = Component::from_file(&engine, &path).map_err(|e| anyhow!("loading {path}: {e:#}"))?;
                 let mut linker: Linker<State<X>> = Linker::new(&engine);
@@ -1047,7 +1060,7 @@ fn run_inner<X: Send + 'static>(ext: Extension<X>) -> Result<i32> {
     let usage = {
         let extra: String = ext.grant_flags.iter().map(|(f, h)| format!("\n  {f:<24} {h}")).collect();
         format!(
-            "usage: {} [GRANTS]... [LIFECYCLE]... COMPONENT.wasm COMMAND [ARGS]\n\ngrants:\n  --allow-http HOST[:PORT]  let the component make HTTP requests to this host\n  --secret NAME             let the component read NAME from this host's environment\n  --data-dir DIR            let the component keep files in DIR (it sees it as /data)\n  --data                    the same, with the tool's standard data directory (as its native build uses)\n  --grant-declared          grant what the tool declares it needs (describe's needs: HTTP hosts, secrets, data){extra}\n\nlifecycle (for components exporting opinionated:tool/lifecycle):\n  --suspend-idle SECS       ask the component to suspend after SECS without calls\n  --recycle-above-mb N      ask it to suspend when its memory passes N MiB; a fresh instance starts small\n  --snapshot FILE           resume from FILE, and ask it to suspend into FILE on exit",
+            "usage: {} [GRANTS]... [LIFECYCLE]... COMPONENT.wasm COMMAND [ARGS]\n\ngrants:\n  --allow-http HOST[:PORT]  let the component make HTTP requests to this host\n  --secret NAME             let the component read NAME from this host's environment\n  --data-dir DIR            let the component keep files in DIR (it sees it as /data)\n  --data                    the same, with the tool's standard data directory (as its native build uses)\n  --grant-declared          grant what the tool declares it needs (describe's needs: HTTP hosts, secrets, data){extra}\n\nlifecycle (for components exporting opinionated:tool/lifecycle):\n  --suspend-idle SECS       ask the component to suspend after SECS without calls\n  --recycle-above-mb N      ask it to suspend when its memory passes N MiB; a fresh instance starts small\n  --snapshot FILE           resume from FILE, and ask it to suspend into FILE on exit\n\nother:\n  --no-cache                compile the component every run (the compilation cache is on by default)",
             ext.name
         )
     };
@@ -1076,6 +1089,7 @@ fn run_inner<X: Send + 'static>(ext: Extension<X>) -> Result<i32> {
                 life.recycle_above = Some(mb << 20);
             }
             Some("--snapshot") => life.snapshot_file = Some(args.next().context("--snapshot needs a file")?.into()),
+            Some("--no-cache") => life.no_cache = true,
             Some("-h" | "--help") | None => {
                 eprintln!("{usage}");
                 return Ok(0);
