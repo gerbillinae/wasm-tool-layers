@@ -49,7 +49,11 @@ impl HttpOut for WasiHttp {
 
 /// The instance's linear memory, in bytes.
 pub fn memory_bytes() -> u64 {
-    core::arch::wasm32::memory_size::<0>() as u64 * 65536
+    #[cfg(target_arch = "wasm32")]
+    return core::arch::wasm32::memory_size::<0>() as u64 * 65536;
+    // The crate is only for components; this keeps it compiling natively.
+    #[cfg(not(target_arch = "wasm32"))]
+    0
 }
 
 /// JSON nulls dropped, so absent WIT options become absent fields and the
