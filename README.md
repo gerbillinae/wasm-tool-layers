@@ -16,6 +16,7 @@ The design and its reasoning are in [opinionated/optional/wasm.md](https://githu
 | `tool-serve` | hosts | The listening socket (hyper): localhost only, Origin and Host checks, forwarding with a "client gone" signal; the `serve` command |
 | `tool-native` | native builds | The core on an owner thread behind a `Backend` handle, native port implementations, and the standard CLI (`run`) |
 | `tool-wasi` | components | WASI 0.3 glue: an async HTTP client, and serving `tool-rest` as `wasi:http/handler` |
+| `tool-files` | tool cores | Lock files and atomic writes over std::fs, for data a tool keeps in its granted directory; the same code natively and in a component |
 | `tool-host` | WASM hosts | The generic host as a library (wasmtime): grants, the owner thread, typed command calls, suspend and resume, and extensions for custom capabilities |
 | `wasm-tool` | users | `tool-host` with nothing added: runs any tool component |
 | `tool-audio` | tools that play sound | A command-line player, as a native port and (feature `host`) as the `local:audio/player` WIT interface; `stub/` is a component that implements it as unavailable |
@@ -57,6 +58,12 @@ The fresh instance is configured as before, then given the snapshot (`resume`) b
 --recycle-above-mb N      ask it to suspend when its memory passes N MiB (and twice a fresh instance's)
 --snapshot FILE           resume from FILE, and ask it to suspend into FILE on exit
 ```
+
+## Keeping data
+
+A tool that keeps data of its own gets a directory: `Ports::data_dir`. A native tool picks one (`tool_native::ports::default_data_dir`), and a WASM host grants one with `--data-dir DIR`, which the component sees as `/data`. The tool reads and writes it with plain std::fs and decides its own format and locking. Several processes may share the directory: two MCP servers, a CLI run, or the native build next to the component. wasi:filesystem has no advisory locks, so `tool-files` builds lock files from exclusive create, with atomic writes by rename. A lock waits by the tool's own timer, so a holder in the same process carries on while others wait.
+
+Use a self-describing format for data that outlives builds, such as JSON with serde defaults, and keep postcard for snapshots.
 
 ## Versions
 

@@ -382,6 +382,12 @@ impl Route {
     pub fn post(path: &str) -> Route {
         Route::new("POST", path)
     }
+    pub fn patch(path: &str) -> Route {
+        Route::new("PATCH", path)
+    }
+    pub fn delete(path: &str) -> Route {
+        Route::new("DELETE", path)
+    }
     pub fn new(method: &str, path: &str) -> Route {
         Route {
             method: method.into(),

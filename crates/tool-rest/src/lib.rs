@@ -233,7 +233,13 @@ async fn command(svc: Rc<dyn Service>, desc: &Description, route: &Route, params
             }
         }
     };
-    input.extend(params);
+    // Path parameters arrive as text; type them by the command's schema,
+    // as query values are (/api/drafts/{draft_id}/cards/{card_id}).
+    let pairs: Vec<(String, String)> = params.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string())).collect();
+    match decode_query(desc, name, &pairs) {
+        Ok(typed) => input.extend(typed),
+        Err(e) => return error_response(desc, &e),
+    }
     let result = svc.invoke(&Context::new("web"), name, Value::Object(input)).await;
     match (result, &route.bytes) {
         (Err(e), _) => error_response(desc, &e),

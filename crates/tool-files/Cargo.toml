@@ -1,0 +1,12 @@
+[package]
+name = "tool-files"
+description = "Files a tool keeps in a granted directory: lock files and atomic writes over std::fs, natively and in a WASI component."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+futures = { version = "0.3", features = ["executor"] }

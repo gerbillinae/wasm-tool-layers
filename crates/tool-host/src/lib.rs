@@ -47,7 +47,12 @@ pub struct Grants {
     pub secrets: Vec<String>,
     /// Grant flags an extension added (e.g. --audio) that were given.
     pub flags: Vec<String>,
+    /// A directory the component may keep files in, mounted at /data.
+    pub data_dir: Option<std::path::PathBuf>,
 }
+
+/// Where a granted data directory appears inside the component.
+pub const DATA_MOUNT: &str = "/data";
 
 /// Outgoing HTTP is checked against the granted authorities before it's
 /// sent.
@@ -522,10 +527,12 @@ async fn run_job<X: Send + 'static>(a: &wasmtime::component::Accessor<State<X>>,
             }
             let _ = r.send(out);
         }
-        Job::Invoke(cx, command, input, Some(iface), r) => {
+        // Commands the typed interface doesn't export (their types don't
+        // fit WIT well, e.g. maps) go through the JSON invoke.
+        Job::Invoke(cx, command, input, Some(iface), r) if typed_func(a, &ex.instance, &iface, &command).is_some() => {
             let _ = r.send(typed_invoke(a, &ex.instance, &iface, cx, &command, input).await);
         }
-        Job::Invoke(cx, command, input, None, r) => {
+        Job::Invoke(cx, command, input, _, r) => {
             let out = t.call_invoke(a, cx, command, input.to_string()).await.map_err(trap).and_then(|x| x.map_err(from_wit_err));
             let _ = r.send(out.and_then(|s| {
                 serde_json::from_str(&s).map_err(|e| ToolError::new("internal", format!("the component's result isn't JSON: {e}")))
@@ -587,6 +594,20 @@ impl Extension<()> {
     }
 }
 
+/// The typed export for a command, if the interface has one.
+fn typed_func<X: Send + 'static>(
+    a: &wasmtime::component::Accessor<State<X>>,
+    instance: &wasmtime::component::Instance,
+    iface: &str,
+    command: &str,
+) -> Option<wasmtime::component::Func> {
+    a.with(|mut s| {
+        let i = instance.get_export_index(&mut s, None, iface)?;
+        let f = instance.get_export_index(&mut s, Some(&i), command)?;
+        instance.get_func(&mut s, f)
+    })
+}
+
 /// Calls a command through the component's typed interface: JSON in,
 /// converted to WIT values by the function's own types; WIT out, converted
 /// back. Commands without input take only the context.
@@ -599,12 +620,7 @@ async fn typed_invoke<X: Send + 'static>(
     input: Value,
 ) -> Result<Value, ToolError> {
     use wasmtime::component::Val;
-    let func = a
-        .with(|mut s| {
-            let i = instance.get_export_index(&mut s, None, iface)?;
-            let f = instance.get_export_index(&mut s, Some(&i), command)?;
-            instance.get_func(&mut s, f)
-        })
+    let func = typed_func(a, instance, iface, command)
         .ok_or_else(|| ToolError::new(tool_contract::codes::UNKNOWN_COMMAND, format!("{iface} has no function {command}")))?;
     let (params, results): (Vec<(String, wasmtime::component::Type)>, Vec<wasmtime::component::Type>) = a.with(|s| {
         let ty = func.ty(&s);
@@ -778,9 +794,16 @@ fn load<X: Send + 'static>(
                 }
                 let started = std::time::Instant::now();
                 let instantiate = async {
-                    // No files, no environment, no sockets: only stderr, for
-                    // the component's own panics.
-                    let wasi = WasiCtx::builder().inherit_stderr().build();
+                    // No environment, no sockets, no files but the granted
+                    // data directory: only stderr, for the component's own
+                    // panics.
+                    let mut wasi = WasiCtx::builder();
+                    wasi.inherit_stderr();
+                    if let Some(dir) = &grants.data_dir {
+                        wasi.preopened_dir(dir, DATA_MOUNT, wasmtime_wasi::FsPerms::ReadWrite)
+                            .map_err(|e| anyhow!("granting {}: {e:#}", dir.display()))?;
+                    }
+                    let wasi = wasi.build();
                     let wake = Arc::new(tokio::sync::Notify::new());
                     let data = State {
                         wasi,
@@ -919,7 +942,7 @@ fn run_inner<X: Send + 'static>(ext: Extension<X>) -> Result<i32> {
     let usage = {
         let extra: String = ext.grant_flags.iter().map(|(f, h)| format!("\n  {f:<24} {h}")).collect();
         format!(
-            "usage: {} [GRANTS]... [LIFECYCLE]... COMPONENT.wasm COMMAND [ARGS]\n\ngrants:\n  --allow-http HOST[:PORT]  let the component make HTTP requests to this host\n  --secret NAME             let the component read NAME from this host's environment{extra}\n\nlifecycle (for components exporting opinionated:tool/lifecycle):\n  --suspend-idle SECS       ask the component to suspend after SECS without calls\n  --recycle-above-mb N      ask it to suspend when its memory passes N MiB; a fresh instance starts small\n  --snapshot FILE           resume from FILE, and ask it to suspend into FILE on exit",
+            "usage: {} [GRANTS]... [LIFECYCLE]... COMPONENT.wasm COMMAND [ARGS]\n\ngrants:\n  --allow-http HOST[:PORT]  let the component make HTTP requests to this host\n  --secret NAME             let the component read NAME from this host's environment\n  --data-dir DIR            let the component keep files in DIR (it sees it as /data){extra}\n\nlifecycle (for components exporting opinionated:tool/lifecycle):\n  --suspend-idle SECS       ask the component to suspend after SECS without calls\n  --recycle-above-mb N      ask it to suspend when its memory passes N MiB; a fresh instance starts small\n  --snapshot FILE           resume from FILE, and ask it to suspend into FILE on exit",
             ext.name
         )
     };
@@ -930,6 +953,11 @@ fn run_inner<X: Send + 'static>(ext: Extension<X>) -> Result<i32> {
         match args.next().as_deref() {
             Some("--allow-http") => grants.http.push(args.next().context("--allow-http needs HOST or HOST:PORT")?),
             Some("--secret") => grants.secrets.push(args.next().context("--secret needs a name")?),
+            Some("--data-dir") => {
+                let dir = std::path::PathBuf::from(args.next().context("--data-dir needs a directory")?);
+                std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+                grants.data_dir = Some(dir.canonicalize()?);
+            }
             Some("--suspend-idle") => {
                 let secs: f64 = args.next().context("--suspend-idle needs seconds")?.parse().context("--suspend-idle needs seconds")?;
                 life.idle = Some(std::time::Duration::from_secs_f64(secs));

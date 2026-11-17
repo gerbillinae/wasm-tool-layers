@@ -6,6 +6,7 @@ members = ["crates/*", "crates/tool-audio/stub"]
 default-members = [
     "crates/tool-contract",
     "crates/tool-ports",
+    "crates/tool-files",
     "crates/tool-cli",
     "crates/tool-mcp",
     "crates/tool-rest",

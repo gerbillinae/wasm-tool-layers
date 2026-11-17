@@ -134,6 +134,12 @@ pub struct Ports {
     pub notify: Box<dyn Notify>,
     /// None on a host that can't serve HTTP.
     pub listener: Option<Box<dyn Listener>>,
+    /// A directory the tool may keep files in, for data that outlives the
+    /// process (std::fs works on it natively and in a component, where the
+    /// host mounts its grant at /data). None if there's none: features
+    /// needing it are unavailable. The tool manages its own locking
+    /// (tool-files has lock files and atomic writes).
+    pub data_dir: Option<std::path::PathBuf>,
 }
 
 /// A Progress that drops everything.
